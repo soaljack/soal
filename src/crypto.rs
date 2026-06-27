@@ -49,8 +49,27 @@ pub fn decrypt(ciphertext: &[u8], key: &Key) -> Result<Vec<u8>, SoalError> {
 }
 
 /// Helper: encrypt a chunk's data. Returns the blob to store on disk.
+/// (Non-deterministic; used only if needed.)
 pub fn encrypt_chunk(plain: &[u8], key: &Key) -> Result<Vec<u8>, SoalError> {
     encrypt(plain, key)
+}
+
+/// Encrypt a plaintext chunk deterministically for the ciphertext-hash storage model.
+/// Nonce is derived from BLAKE3(plain) so that identical plaintext + vault key
+/// always produces identical (nonce + ct). This enables deduplication inside the vault
+/// while the on-disk key remains BLAKE3 of the ciphertext blob.
+pub fn encrypt_deterministic(plain: &[u8], key: &Key) -> Result<Vec<u8>, SoalError> {
+    let p_hash = blake3::hash(plain);
+    let nonce = &p_hash.as_bytes()[..24];
+    let cipher = XChaCha20Poly1305::new(key.into());
+    let ct = cipher
+        .encrypt(nonce.into(), plain)
+        .map_err(|e| SoalError::Crypto(e.to_string()))?;
+
+    let mut out = Vec::with_capacity(24 + ct.len());
+    out.extend_from_slice(nonce);
+    out.extend_from_slice(&ct);
+    Ok(out)
 }
 
 /// Decrypt a stored chunk blob.
@@ -78,5 +97,28 @@ mod tests {
         let data = b"secret";
         let enc = encrypt(data, &key1).unwrap();
         assert!(decrypt(&enc, &key2).is_err());
+    }
+
+    #[test]
+    fn deterministic_encrypt_produces_same_ct_for_same_plain() {
+        let key = generate_key();
+        let data = b"identical chunk for dedup test 98765";
+        let ct1 = encrypt_deterministic(data, &key).unwrap();
+        let ct2 = encrypt_deterministic(data, &key).unwrap();
+        assert_eq!(ct1, ct2, "deterministic encrypt must be stable");
+
+        // Different plain -> different ct
+        let data2 = b"different chunk";
+        let ct3 = encrypt_deterministic(data2, &key).unwrap();
+        assert_ne!(ct1, ct3);
+    }
+
+    #[test]
+    fn deterministic_roundtrip() {
+        let key = generate_key();
+        let data = b"roundtrip deterministic soal 123";
+        let enc = encrypt_deterministic(data, &key).unwrap();
+        let dec = decrypt(&enc, &key).unwrap();
+        assert_eq!(dec, data);
     }
 }

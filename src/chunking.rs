@@ -35,11 +35,14 @@ impl ChunkConfig {
     }
 }
 
-/// A content chunk: hash of the plaintext bytes + the bytes
+/// A plaintext content chunk produced by CDC.
+/// The `hash` here is the BLAKE3 of plaintext (used for internal purposes / tests).
+/// The actual storage key in an encrypted vault is the BLAKE3 of the *ciphertext*
+/// (see Vault::store_chunk and Security Model).
 #[derive(Clone, Debug)]
 pub struct Chunk {
-    pub hash: ContentHash,
-    pub data: Vec<u8>,
+    pub hash: ContentHash, // plaintext BLAKE3 (for reference/dedup logic inside chunker)
+    pub data: Vec<u8>,     // plaintext
 }
 
 impl Chunk {

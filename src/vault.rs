@@ -1,7 +1,7 @@
 //! Vault management for Phase 0 (local only)
 use crate::chunking::{chunk_bytes, Chunk, ChunkConfig};
 use crate::commit::{Commit, create_initial_commit};
-use crate::crypto::{decrypt_chunk, encrypt_chunk, generate_key, Key};
+use crate::crypto::{decrypt_chunk, encrypt_deterministic, generate_key, Key};
 use crate::store::ChunkStore;
 use crate::tree::{Tree, TreeEntry};
 use crate::{ContentHash, SoalError};
@@ -140,13 +140,17 @@ impl Vault {
         Ok(vaults)
     }
 
-    fn store_chunk(&self, chunk: &Chunk) -> Result<(), SoalError> {
+    fn store_chunk(&self, chunk: &Chunk) -> Result<ContentHash, SoalError> {
+        let plain = &chunk.data;
         let data_to_store = if let Some(k) = &self.key {
-            encrypt_chunk(&chunk.data, k)?
+            encrypt_deterministic(plain, k)?
         } else {
-            chunk.data.clone()
+            plain.clone()
         };
-        self.chunk_store.put(chunk.hash, &data_to_store)
+        // Storage key is always BLAKE3 of what we actually store (ciphertext when encrypted).
+        let store_hash: ContentHash = blake3::hash(&data_to_store).into();
+        self.chunk_store.put(store_hash, &data_to_store)?;
+        Ok(store_hash)
     }
 
     fn load_chunk(&self, hash: &ContentHash) -> Result<Vec<u8>, SoalError> {
@@ -158,14 +162,15 @@ impl Vault {
         }
     }
 
-    /// Store chunks and return their hashes
+    /// Store chunks (plaintext) and return the *storage hashes* (ciphertext hash when encryption enabled).
+    /// This implements the "chunk plaintext → encrypt → address by ct hash" model.
     fn store_chunks(&self, chunks: &[Chunk]) -> Result<Vec<ContentHash>, SoalError> {
-        let mut hashes = Vec::new();
+        let mut store_hashes = Vec::new();
         for c in chunks {
-            self.store_chunk(c)?;
-            hashes.push(c.hash);
+            let h = self.store_chunk(c)?;
+            store_hashes.push(h);
         }
-        Ok(hashes)
+        Ok(store_hashes)
     }
 
     /// Create a simple tree from a list of files (flat for MVP)
@@ -355,9 +360,15 @@ fn walkdir_simple<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, SoalError> {
                 let mut file_data = Vec::new();
                 for h in chunks {
                     let chunk_plain = self.load_chunk(h)?;
-                    // verify
-                    let computed: ContentHash = blake3::hash(&chunk_plain).into();
-                    if computed != *h {
+                    // verify: re-derive the storage hash from the plaintext
+                    // (for encrypted: re-encrypt det and hash ct; for plain: hash plain)
+                    let derived_hash: ContentHash = if let Some(k) = &self.key {
+                        let re_blob = encrypt_deterministic(&chunk_plain, k)?;
+                        blake3::hash(&re_blob).into()
+                    } else {
+                        blake3::hash(&chunk_plain).into()
+                    };
+                    if derived_hash != *h {
                         return Err(SoalError::Other("chunk hash mismatch on restore".into()));
                     }
                     file_data.extend_from_slice(&chunk_plain);

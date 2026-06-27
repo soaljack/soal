@@ -84,10 +84,12 @@ Soal aims to be the reliable, private foundation for personal and community data
 All core data is **content-addressed** and **immutable** where possible.
 
 ### 4.1 Chunks (Blobs)
-- Files are split using **Content-Defined Chunking (CDC)** (Rabin fingerprint or FastCDC variant).
+- Files are split using **Content-Defined Chunking (CDC)** (Rabin fingerprint or FastCDC variant) performed on **plaintext**.
 - Target average chunk size: **Configurable per vault or globally**. Default starting goal: ~2 MiB average (tunable; system may recommend larger sizes as cluster/data patterns stabilize).
-- Each chunk is stored and referenced by its **BLAKE3 hash** (32-byte root hash). BLAKE3's internal tree hashing enables efficient verified streaming and range requests.
-- Chunks may be compressed (optional, zstd/LZ4) and/or encrypted (default on) before final hashing or with separate key wrapping.
+- When encryption is enabled for the vault (default): each plaintext chunk is encrypted with the vault's symmetric key; the chunk is then stored and referenced in Trees/Commits by the **BLAKE3 hash of the ciphertext** (encrypted blob, including nonce).
+- When encryption is disabled: the reference is the BLAKE3 hash of the plaintext.
+- BLAKE3's internal tree hashing enables efficient verified streaming and range requests.
+- Chunks may be compressed (optional, zstd/LZ4) before encryption.
 - Reference counting + garbage collection for unreferenced chunks (after configurable retention or explicit GC).
 
 ### 4.2 Trees
@@ -143,6 +145,24 @@ Nodes maintain local pin sets and gossip presence/health information. A replicat
 - **At rest**: Chunks encrypted before storage (or key-wrapped). User can disable per vault or globally.
 - **In transit**: Iroh QUIC provides authenticated encryption by default.
 - Key management: Local keystore (file + optional passphrase or hardware integration later). Simple per-vault master key derivation.
+
+### 5.2.1 Encryption + Content Addressing Approach
+Soal combines plaintext chunking with per-vault encryption and ciphertext-based content addressing as follows (the model used in the reference implementation):
+
+1. **Plaintext CDC chunking first**: Files are divided using Content-Defined Chunking on the original *plaintext*. This step is performed before any encryption so that identical content produces identical chunks, enabling deduplication *within a vault*.
+
+2. **Per-vault encryption**: The plaintext chunk is encrypted using a symmetric key that is unique to the vault (XChaCha20-Poly1305 AEAD). A nonce is derived deterministically from the plaintext chunk (e.g., from its BLAKE3 hash) so that identical plaintext + same key always yields identical ciphertext. This preserves the deduplication benefit while keeping encryption secure.
+
+3. **Store and reference by ciphertext hash**: The encrypted blob (nonce + ciphertext) is written to the local store. The *chunk identifier* placed into Merkle Trees (and thus referenced by Commits) is the BLAKE3 hash of the *ciphertext blob*. The on-disk and in-cluster content address is therefore always a hash of ciphertext when encryption is enabled.
+
+When `encryption_enabled=false` for a vault, chunking + hashing uses plaintext directly (no encryption step).
+
+**Deduplication trade-off**:
+- Strong intra-vault deduplication: same plaintext chunk → same deterministic ciphertext → same ciphertext hash → stored only once.
+- No cross-vault deduplication: different vaults have different keys, so even identical plaintexts produce different ciphertexts and different storage hashes.
+- This is the right trade-off for Soal: vaults are the security and membership boundary. All members of a vault receive the same key during secure invite/join, so they all benefit from deduplication while data remains confidential to outsiders. In a trusted local cluster there is no need for convergent encryption schemes that weaken security for the sake of cross-user dedup.
+
+This design keeps the local store simple (keyed by BLAKE3 of whatever is stored) while still delivering the deduplication wins that users expect inside their own data sets.
 
 ### 5.3 Integrity
 - Everything is content-addressed (BLAKE3). Any tampering is immediately detectable.
@@ -277,9 +297,10 @@ CLI is built with `clap`, provides excellent help, progress, and JSON output mod
   - `notify` (filesystem watching)
   - `serde` + CBOR or Protobuf (serialization)
   - Local store: `sled` / RocksDB or custom file-based with iroh-blobs compatibility
-- **Testing**: Heavy use of property-based testing (chunking determinism, Merkle verification, replication invariants), integration tests, and simulation for P2P behavior.
+- **Testing**: Heavy use of property-based testing (chunking determinism, encryption roundtrips, Merkle verification, replication invariants), integration tests, and simulation for P2P behavior.
 - **Cross-compilation**: Prioritize clean `cargo build --target` for x86_64-apple-darwin, aarch64-apple-darwin, x86_64-pc-windows-msvc, etc. from day one.
 - **Modularity**: Separate crates for `soal-core`, `soal-chunking`, `soal-vault`, `soal-sync`, `soal-cli`, etc. This enables independent testing and future module development.
+- **Encryption in Phase 0**: Implement per-vault symmetric keys with plaintext CDC chunking, followed by AEAD encryption (deterministic nonce from plaintext for dedup), storing and addressing chunks by BLAKE3 hash of the ciphertext blob. Support toggling encryption per-vault at creation. See Security Model §5.2.1 for details.
 
 ### Code Quality Standards
 - Small, focused functions and modules.
@@ -353,16 +374,16 @@ CLI is built with `clap`, provides excellent help, progress, and JSON output mod
 ## Appendix: Example Data Flow (Photo Added to Live Vault)
 
 1. User adds photo to watched folder.
-2. CDC splits photo into ~2 MiB chunks (BLAKE3).
-3. Chunks stored locally (encrypted by default).
-4. New Tree and lightweight Commit created (or live head updated).
+2. CDC splits photo into ~2 MiB plaintext chunks (BLAKE3).
+3. Each plaintext chunk is encrypted with the vault key (deterministic for dedup); stored under BLAKE3 hash of the ciphertext.
+4. New Tree (referencing ciphertext hashes) and lightweight Commit created (or live head updated).
 5. Gossip announces new content / head update.
 6. Peers pull missing chunks via verified `iroh-blobs` streams.
 7. Peers apply to their live working trees.
 8. Replication engine ensures min_replicas are satisfied across nodes.
 9. User can later create explicit snapshot for backup point.
 
-All steps are verifiable via content hashes. Encryption protects data at rest and in flight.
+All steps are verifiable via content hashes (ciphertext hashes when encryption is enabled). Encryption protects data at rest and in flight. Key is per-vault and shared only with vault members.
 
 ---
 
