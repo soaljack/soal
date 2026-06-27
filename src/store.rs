@@ -58,8 +58,7 @@ impl ChunkStore {
             let entry = entry?;
             let name = entry.file_name();
             if let Some(name_str) = name.to_str() {
-                if name_str.ends_with(".chunk") {
-                    let hexpart = &name_str[..name_str.len() - 6];
+                if let Some(hexpart) = name_str.strip_suffix(".chunk") {
                     if let Ok(bytes) = hex::decode(hexpart) {
                         if bytes.len() == 32 {
                             let mut arr = [0u8; 32];

@@ -74,8 +74,8 @@ pub fn chunk_bytes(data: &[u8], config: &ChunkConfig) -> Vec<Chunk> {
 
     let mut chunks = Vec::new();
     for entry in chunker {
-        let start = entry.offset as usize;
-        let end = start + entry.length as usize;
+        let start = entry.offset;
+        let end = start + entry.length;
         if end <= data.len() {
             let chunk_data = data[start..end].to_vec();
             chunks.push(Chunk::from_data(chunk_data));

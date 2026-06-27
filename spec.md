@@ -5,7 +5,7 @@
 **Status:** Draft for review and iterative refinement  
 **Project:** Soal (Soal Protocol / SoalFS)  
 **Founder / BDFL:** Jeffrey Stewart (@soaljack)  
-**License:** MIT or Apache-2.0 (to be confirmed)  
+**License:** MIT OR Apache-2.0 (dual license)  
 **Primary Platforms (initial):** macOS, Windows (Linux support from day one)
 
 ---
@@ -345,7 +345,7 @@ CLI is built with `clap`, provides excellent help, progress, and JSON output mod
 - **Early stage**: BDFL model with Jeffrey Stewart (@soaljack) as founder making final architectural and directional decisions to maintain high quality and focus.
 - Clear documentation of decisions and rationale.
 - Transition path to broader community governance (e.g., steering committee, foundation) as the project matures and adoption grows.
-- **Licensing**: MIT and/or Apache-2.0 (permissive, business-friendly). To be finalized in repository setup.
+- **Licensing**: Dual MIT/Apache-2.0 (permissive, business-friendly). Finalized in the repository (see LICENSE, LICENSE-MIT, LICENSE-APACHE).
 - Contribution model: Clear CONTRIBUTING.md emphasizing quality, tests, and incremental delivery.
 
 ---

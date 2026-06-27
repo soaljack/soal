@@ -54,7 +54,7 @@ impl Vault {
             None
         };
 
-        let key_hex = key.map(|k| hex::encode(k));
+        let key_hex = key.map(hex::encode);
 
         let config = VaultConfig {
             name: name.to_string(),

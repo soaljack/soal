@@ -1,8 +1,19 @@
 # soal
 
+[![CI](https://github.com/soaljack/soal/actions/workflows/ci.yml/badge.svg)](https://github.com/soaljack/soal/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-MIT%2FApache-blue)](LICENSE)
+
 **Soal** — A lightweight, sovereign, open-source protocol for secure, redundant, versioned, content-addressed distributed file storage and synchronization.
 
 Designed for local networks first (LAN, home clusters, off-grid), with a clean path to opt-in internet peering.
+
+## Links
+
+- **Repository**: https://github.com/soaljack/soal
+- **Spec**: [spec.md](spec.md)
+- **Contributing**: [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Code of Conduct**: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- **Security**: [SECURITY.md](SECURITY.md)
 
 ## Status
 
@@ -61,9 +72,27 @@ soal restore <commit-hash> [--to <dir>] [--vault <name>]
 
 - Phase 1: Iroh networking, live sync across nodes, replication policy, gossip
 
+## CI
+
+GitHub Actions runs on push and pull requests:
+
+- `cargo fmt --check`
+- `cargo clippy -- -D warnings`
+- Full test suite (including E2E) on **Ubuntu, macOS, and Windows**
+- Release binaries are built and uploaded as artifacts
+
+See [.github/workflows/ci.yml](.github/workflows/ci.yml).
+
+## Contributing
+
+We follow standard open source practices. Please read:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+
 ## Links
 
-- Founder: [@soaljack](https://github.com/soaljack)
-- License: MIT / Apache-2.0 (TBD)
+- Founder / BDFL: [@soaljack](https://github.com/soaljack)
+- License: [MIT OR Apache-2.0](LICENSE)
 
 *Your data, your network, your rules.*
