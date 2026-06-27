@@ -6,21 +6,60 @@ Designed for local networks first (LAN, home clusters, off-grid), with a clean p
 
 ## Status
 
-This is the initial draft of the protocol specification.
+**Phase 0 (Core Local Foundation) is implemented** — a usable local backup + snapshot tool.
 
 See [spec.md](./spec.md) for the full Soal Protocol Specification (v0.1).
 
-## Key Ideas
+## Phase 0 Features (Current)
 
-- Content-defined chunking (CDC) + BLAKE3
-- Git-like Merkle DAG commits + live working tree sync
-- Iroh-powered peer-to-peer (primary)
-- Strong encryption and sovereignty by default
-- Configurable replication across trusted nodes
+- Configurable Content-Defined Chunking (FastCDC + BLAKE3)
+- Local encrypted chunk store (encryption **on by default**, toggleable per vault)
+- Merkle directory trees + immutable commits (Git-style history)
+- Vaults: create, add files/directories, manual snapshots, restore any commit
+- Full CLI (clap)
+- Property-based tests for chunking determinism, encryption, roundtrips
+- Simple file-based storage
+
+## Quick Start
+
+```bash
+cargo install --path .   # or use target/debug/soal
+soal init
+soal vault create photos
+soal add ./vacation-photos --vault photos
+soal snapshot "Before the big trip" --vault photos
+soal status --vault photos
+
+# Restore
+soal restore <64-char-commit-hash> --vault photos --to ./restored
+```
+
+Your data is stored (encrypted) under `~/.soal/vaults/<name>/`.
+
+## CLI Reference (Phase 0)
+
+```bash
+soal init
+soal vault create <name> [--no-encrypt]
+soal vault list
+soal status [--vault <name>]
+soal add <path> [--vault <name>] [--message "..."]
+soal snapshot "<message>" [--vault <name>]
+soal restore <commit-hash> [--to <dir>] [--vault <name>]
+```
+
+## Architecture (Phase 0)
+
+- `chunking.rs`: FastCDC + BLAKE3
+- `crypto.rs`: XChaCha20-Poly1305 per-vault keys
+- `store.rs`: Simple content-addressed file store
+- `tree.rs` + `commit.rs`: Merkle manifests + DAG commits
+- `vault.rs`: High level operations + on-disk layout
+- `main.rs`: CLI
 
 ## Next Steps
 
-Proceed to Phase 0 implementation scaffold (Rust project structure, core chunking, CLI skeleton).
+- Phase 1: Iroh networking, live sync across nodes, replication policy, gossip
 
 ## Links
 
