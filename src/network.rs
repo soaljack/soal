@@ -136,10 +136,13 @@ impl Network {
         );
 
         let (_sender, mut receiver) = topic.split();
-        // Receive loop for demo (in real app, this would be in a spawned task)
-        for _ in 0..5 {
+
+        // Demo listener: wait briefly for messages (keeps CLI responsive and tests fast).
+        // In a real app this would run in a background task / until shutdown.
+        let short_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < short_deadline {
             if let Ok(Some(Ok(GossipEvent::Received(received)))) =
-                tokio::time::timeout(std::time::Duration::from_secs(5), receiver.next()).await
+                tokio::time::timeout(std::time::Duration::from_millis(300), receiver.next()).await
             {
                 if let Ok(ann) = serde_json::from_slice::<HeadAnnouncement>(&received.content) {
                     println!(
