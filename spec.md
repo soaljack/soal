@@ -389,7 +389,9 @@ All steps are verifiable via content hashes (ciphertext hashes when encryption i
 
 **This specification is a living document.** It will be refined through implementation, testing, and community feedback while maintaining focus on high-quality, reliable, modular code delivered in testable increments.
 
-**Next actions after review**: Proceed to Phase 0 implementation scaffold (Rust project structure, core chunking + commit logic, CLI skeleton) targeting macOS and Windows.
+**Phase 0 status**: Complete (see implementation in src/ and tests/).
+
+**Next actions**: Proceed to Phase 1 – Multi-Node Live Sync (Iroh integration, LAN discovery, gossip for heads, basic replication, live working tree sync).
 
 ---
 

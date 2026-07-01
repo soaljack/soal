@@ -9,13 +9,8 @@ use std::path::Path;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TreeEntry {
-    File {
-        size: u64,
-        chunks: Vec<ContentHash>,
-    },
-    Dir {
-        hash: ContentHash,
-    },
+    File { size: u64, chunks: Vec<ContentHash> },
+    Dir { hash: ContentHash },
 }
 
 /// A Merkle tree representing a directory snapshot
@@ -39,15 +34,14 @@ impl Tree {
 
     /// Add a file entry
     pub fn add_file(&mut self, path: &str, size: u64, chunks: Vec<ContentHash>) {
-        self.entries.insert(
-            path.to_string(),
-            TreeEntry::File { size, chunks },
-        );
+        self.entries
+            .insert(path.to_string(), TreeEntry::File { size, chunks });
     }
 
     /// Add a subdirectory reference
     pub fn add_dir(&mut self, path: &str, hash: ContentHash) {
-        self.entries.insert(path.to_string(), TreeEntry::Dir { hash });
+        self.entries
+            .insert(path.to_string(), TreeEntry::Dir { hash });
     }
 
     /// Serialize to JSON (pretty for human, but we use compact for hash)
@@ -69,9 +63,7 @@ impl Default for Tree {
 /// Build a tree from a filesystem path (recursively).
 /// This is a simplified version for Phase 0 (single level + files for MVP).
 /// Full recursive tree building will be added.
-pub fn build_tree_from_path<P: AsRef<Path>>(
-    _base: P,
-) -> Result<Tree, SoalError> {
+pub fn build_tree_from_path<P: AsRef<Path>>(_base: P) -> Result<Tree, SoalError> {
     // Placeholder - we'll implement full walker in vault/add
     // For now return empty tree
     Ok(Tree::new())
@@ -101,5 +93,25 @@ mod tests {
         let json = tree.to_json().unwrap();
         let restored = Tree::from_json(&json).unwrap();
         assert_eq!(tree, restored);
+    }
+
+    #[test]
+    fn tree_multiple_entries_and_hash_change() {
+        let mut t1 = Tree::new();
+        t1.add_file("a.txt", 10, vec![[1u8; 32]]);
+        t1.add_dir("subdir", [2u8; 32]);
+        let h1 = t1.hash();
+
+        let mut t2 = Tree::new();
+        t2.add_file("a.txt", 10, vec![[1u8; 32]]);
+        t2.add_dir("subdir", [99u8; 32]); // different sub
+        let h2 = t2.hash();
+        assert_ne!(h1, h2);
+
+        // same content -> same hash
+        let mut t3 = Tree::new();
+        t3.add_file("a.txt", 10, vec![[1u8; 32]]);
+        t3.add_dir("subdir", [2u8; 32]);
+        assert_eq!(t3.hash(), h1);
     }
 }

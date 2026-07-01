@@ -20,8 +20,8 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SOAL_BIN="${PROJECT_ROOT}/target/debug/soal"
 
 if [[ ! -x "$SOAL_BIN" ]]; then
-    echo "Building release for testing..."
-    (cd "$PROJECT_ROOT" && source "$HOME/.cargo/env" && cargo build)
+    echo "Building debug for testing..."
+    (cd "$PROJECT_ROOT" && cargo build) || (cd "$PROJECT_ROOT" && source "$HOME/.cargo/env" 2>/dev/null || true && cargo build)
 fi
 
 echo "=== Soal Phase 0 End-to-End Tests ==="

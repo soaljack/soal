@@ -1,6 +1,6 @@
 //! Vault management for Phase 0 (local only)
 use crate::chunking::{chunk_bytes, Chunk, ChunkConfig};
-use crate::commit::{Commit, create_initial_commit};
+use crate::commit::{create_initial_commit, Commit};
 use crate::crypto::{decrypt_chunk, encrypt_deterministic, generate_key, Key};
 use crate::store::ChunkStore;
 use crate::tree::{Tree, TreeEntry};
@@ -186,7 +186,10 @@ impl Vault {
     fn save_tree(&self, tree: &Tree) -> Result<ContentHash, SoalError> {
         let hash = tree.hash();
         let json = tree.to_json()?;
-        let path = self.root.join(TREES_DIR).join(format!("{}.json", hex::encode(hash)));
+        let path = self
+            .root
+            .join(TREES_DIR)
+            .join(format!("{}.json", hex::encode(hash)));
         fs::write(path, json)?;
         Ok(hash)
     }
@@ -195,7 +198,10 @@ impl Vault {
     fn save_commit(&self, commit: &Commit) -> Result<ContentHash, SoalError> {
         let hash = commit.hash();
         let json = commit.to_json()?;
-        let path = self.root.join(COMMITS_DIR).join(format!("{}.json", hex::encode(hash)));
+        let path = self
+            .root
+            .join(COMMITS_DIR)
+            .join(format!("{}.json", hex::encode(hash)));
         fs::write(path, json)?;
         Ok(hash)
     }
@@ -265,7 +271,11 @@ impl Vault {
         let tree = self.build_simple_tree(&file_entries);
         let tree_hash = self.save_tree(&tree)?;
 
-        let msg = if path.is_dir() { format!("Add dir {}", base_name) } else { format!("Add {}", base_name) };
+        let msg = if path.is_dir() {
+            format!("Add dir {}", base_name)
+        } else {
+            format!("Add {}", base_name)
+        };
         let commit = create_initial_commit(tree_hash, &msg);
         let commit_hash = self.save_commit(&commit)?;
         self.set_head(commit_hash)?;
@@ -282,25 +292,24 @@ impl Vault {
         self.add_path(file_path, logical_name)
     }
 
-
-/// Simple recursive directory walker (no extra deps)
-fn walkdir_simple<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, SoalError> {
-    let mut files = Vec::new();
-    fn visit(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), SoalError> {
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let p = entry.path();
-            if p.is_dir() {
-                visit(&p, out)?;
-            } else if p.is_file() {
-                out.push(p);
+    /// Simple recursive directory walker (no extra deps)
+    fn walkdir_simple<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, SoalError> {
+        let mut files = Vec::new();
+        fn visit(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), SoalError> {
+            for entry in fs::read_dir(dir)? {
+                let entry = entry?;
+                let p = entry.path();
+                if p.is_dir() {
+                    visit(&p, out)?;
+                } else if p.is_file() {
+                    out.push(p);
+                }
             }
+            Ok(())
         }
-        Ok(())
+        visit(dir.as_ref(), &mut files)?;
+        Ok(files)
     }
-    visit(dir.as_ref(), &mut files)?;
-    Ok(files)
-}
 
     /// Create a snapshot commit (manual)
     pub fn snapshot(&mut self, message: &str) -> Result<ContentHash, SoalError> {
@@ -310,12 +319,7 @@ fn walkdir_simple<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, SoalError> {
             let head_commit = self.load_commit(current_head)?;
             let tree_hash = head_commit.tree;
 
-            let new_commit = Commit::new(
-                tree_hash,
-                vec![current_head],
-                "soal-local",
-                message,
-            );
+            let new_commit = Commit::new(tree_hash, vec![current_head], "soal-local", message);
             let commit_hash = self.save_commit(&new_commit)?;
             self.set_head(commit_hash)?;
             return Ok(commit_hash);
@@ -331,7 +335,10 @@ fn walkdir_simple<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, SoalError> {
     }
 
     fn load_commit(&self, hash: ContentHash) -> Result<Commit, SoalError> {
-        let path = self.root.join(COMMITS_DIR).join(format!("{}.json", hex::encode(hash)));
+        let path = self
+            .root
+            .join(COMMITS_DIR)
+            .join(format!("{}.json", hex::encode(hash)));
         if !path.exists() {
             return Err(SoalError::Other("commit not found".into()));
         }
@@ -346,7 +353,10 @@ fn walkdir_simple<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, SoalError> {
         target_dir: P,
     ) -> Result<(), SoalError> {
         let commit = self.load_commit(commit_hash)?;
-        let tree_path = self.root.join(TREES_DIR).join(format!("{}.json", hex::encode(commit.tree)));
+        let tree_path = self
+            .root
+            .join(TREES_DIR)
+            .join(format!("{}.json", hex::encode(commit.tree)));
         if !tree_path.exists() {
             return Err(SoalError::Other("tree not found for commit".into()));
         }
@@ -402,6 +412,63 @@ fn walkdir_simple<P: AsRef<Path>>(dir: P) -> Result<Vec<PathBuf>, SoalError> {
         };
         Ok(msg)
     }
+
+    // --- Phase 1 sync/ingest helpers (for network transfer of manifests + stored chunks) ---
+
+    /// Read raw stored bytes for a chunk (ct or plain) for providing over network.
+    pub fn export_stored_chunk(&self, hash: ContentHash) -> Result<Vec<u8>, SoalError> {
+        self.chunk_store.get(&hash)
+    }
+
+    /// Write raw received stored bytes under the given storage hash (no re-encrypt).
+    /// Used by sync to import chunks received from peers.
+    pub fn import_stored_chunk(&self, hash: ContentHash, data: &[u8]) -> Result<(), SoalError> {
+        self.chunk_store.put(hash, data)
+    }
+
+    /// Export raw tree JSON bytes by its hash.
+    pub fn export_tree_bytes(&self, hash: ContentHash) -> Result<Vec<u8>, SoalError> {
+        let path = self
+            .root
+            .join(TREES_DIR)
+            .join(format!("{}.json", hex::encode(hash)));
+        if !path.exists() {
+            return Err(SoalError::Other("tree not found for export".into()));
+        }
+        Ok(fs::read(path)?)
+    }
+
+    /// Import a tree manifest from raw JSON bytes received over network.
+    pub fn import_tree_bytes(&self, hash: ContentHash, data: &[u8]) -> Result<(), SoalError> {
+        let path = self
+            .root
+            .join(TREES_DIR)
+            .join(format!("{}.json", hex::encode(hash)));
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    /// Export raw commit JSON bytes.
+    pub fn export_commit_bytes(&self, hash: ContentHash) -> Result<Vec<u8>, SoalError> {
+        let path = self
+            .root
+            .join(COMMITS_DIR)
+            .join(format!("{}.json", hex::encode(hash)));
+        if !path.exists() {
+            return Err(SoalError::Other("commit not found for export".into()));
+        }
+        Ok(fs::read(path)?)
+    }
+
+    /// Import a commit from raw JSON bytes.
+    pub fn import_commit_bytes(&self, hash: ContentHash, data: &[u8]) -> Result<(), SoalError> {
+        let path = self
+            .root
+            .join(COMMITS_DIR)
+            .join(format!("{}.json", hex::encode(hash)));
+        fs::write(path, data)?;
+        Ok(())
+    }
 }
 
 /// Get the default base directory for Soal data
@@ -410,4 +477,111 @@ pub fn default_soal_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".soal")
         .join("vaults")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn vault_create_and_open_roundtrip() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+
+        let v = Vault::create(base, "testvault", true).unwrap();
+        assert!(v.config.encryption_enabled);
+        assert!(v.key.is_some());
+
+        let opened = Vault::open(base, "testvault").unwrap();
+        assert_eq!(opened.name, "testvault");
+        assert!(opened.config.encryption_enabled);
+    }
+
+    #[test]
+    fn vault_create_no_encrypt() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let v = Vault::create(base, "plain", false).unwrap();
+        assert!(!v.config.encryption_enabled);
+        assert!(v.key.is_none());
+    }
+
+    #[test]
+    fn vault_add_file_and_head_and_restore_basic() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let mut v = Vault::create(base, "rf", true).unwrap();
+
+        // write a temp source file
+        let srcdir = dir.path().join("src");
+        std::fs::create_dir(&srcdir).unwrap();
+        std::fs::write(srcdir.join("hi.txt"), b"hello vault unit test").unwrap();
+
+        let commit = v.add_path(&srcdir, "hi").unwrap();
+        assert!(v.head().unwrap().is_some());
+
+        let restore_to = dir.path().join("out");
+        v.restore(commit, &restore_to).unwrap();
+        let restored = std::fs::read_to_string(restore_to.join("hi/hi.txt")).unwrap();
+        assert_eq!(restored, "hello vault unit test");
+    }
+
+    #[test]
+    fn add_and_list_chunks_after_add() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let mut v = Vault::create(base, "ct", true).unwrap();
+
+        let srcdir = dir.path().join("s2");
+        std::fs::create_dir(&srcdir).unwrap();
+        std::fs::write(srcdir.join("sec.txt"), b"another secret for chunks ct").unwrap();
+
+        let _c = v.add_path(&srcdir, "s2").unwrap();
+
+        let chunks_dir = base.join("ct/chunks");
+        let chunk_files: Vec<_> = std::fs::read_dir(&chunks_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(!chunk_files.is_empty(), "chunks should be stored");
+
+        // For encrypted, the stored file content should NOT contain plaintext
+        let any_plain = chunk_files.iter().any(|e| {
+            if let Ok(data) = std::fs::read(e.path()) {
+                std::str::from_utf8(&data).is_ok_and(|s| s.contains("secret"))
+            } else {
+                false
+            }
+        });
+        assert!(!any_plain, "encrypted storage must not leak plaintext");
+    }
+
+    #[test]
+    fn export_import_roundtrip_for_sync() {
+        let dir = tempdir().unwrap();
+        let base = dir.path();
+        let mut v = Vault::create(base, "syncv", true).unwrap();
+
+        let src = dir.path().join("f");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("x.txt"), b"sync test content 123").unwrap();
+        let c = v.add_path(&src, "f").unwrap();
+
+        // Export/ import commit manifest (key for head sync)
+        let commit_bytes = v.export_commit_bytes(c).expect("commit export");
+
+        // Fresh vault to simulate peer import
+        let v2_dir = tempdir().unwrap();
+        let v2 = Vault::create(v2_dir.path(), "syncv", true).unwrap();
+        v2.import_commit_bytes(c, &commit_bytes)
+            .expect("import commit");
+
+        // Verify the json landed
+        let imported_path = v2_dir
+            .path()
+            .join("syncv/commits")
+            .join(format!("{}.json", hex::encode(c)));
+        assert!(imported_path.exists());
+    }
 }

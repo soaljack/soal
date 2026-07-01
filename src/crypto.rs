@@ -121,4 +121,18 @@ mod tests {
         let dec = decrypt(&enc, &key).unwrap();
         assert_eq!(dec, data);
     }
+
+    #[test]
+    fn nondet_encrypt_differs_from_det_and_is_randomized() {
+        let key = generate_key();
+        let data = b"same data";
+        let d1 = encrypt_deterministic(data, &key).unwrap();
+        let d2 = encrypt_deterministic(data, &key).unwrap();
+        assert_eq!(d1, d2);
+
+        let n1 = encrypt(data, &key).unwrap();
+        let n2 = encrypt(data, &key).unwrap();
+        assert_ne!(n1, n2); // randomized
+        assert_ne!(n1, d1); // different nonce strategy
+    }
 }

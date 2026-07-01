@@ -25,6 +25,12 @@ hex = "0.4"
 dirs = "5.0"
 anyhow = "1.0"
 fastcdc = "3.1"
+iroh = "1.0.0"
+iroh-blobs = "0.103.0"
+iroh-gossip = "0.101.0"
+notify = "8.2.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "rt"] }
+futures-lite = "2.6.1"
 
 [dev-dependencies]
 proptest = "1.6"

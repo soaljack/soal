@@ -1,7 +1,8 @@
-//! Soal core library (Phase 0 - local foundation)
+//! Soal core library (Phase 0 - local foundation, Phase 1 networking starting)
 pub mod chunking;
 pub mod commit;
 pub mod crypto;
+pub mod network;
 pub mod store;
 pub mod tree;
 pub mod vault;

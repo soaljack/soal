@@ -35,7 +35,11 @@ fn vaults_dir(home: &Path) -> std::path::PathBuf {
 /// Create some test data in a directory.
 fn create_test_data(dir: &Path) {
     fs::create_dir_all(dir.join("subdir")).unwrap();
-    fs::write(dir.join("file-a.txt"), "File A content for deduplication test\n").unwrap();
+    fs::write(
+        dir.join("file-a.txt"),
+        "File A content for deduplication test\n",
+    )
+    .unwrap();
     fs::write(dir.join("file-b.txt"), "File B different content here\n").unwrap();
     fs::write(dir.join("subdir/nested.txt"), "Deeply nested content\n").unwrap();
 }
@@ -249,7 +253,10 @@ fn test_multiple_snapshots_create_history() {
         .filter(|e| e.as_ref().unwrap().path().extension() == Some(std::ffi::OsStr::new("json")))
         .count();
 
-    assert!(commit_count >= 2, "expected at least 2 commits, got {commit_count}");
+    assert!(
+        commit_count >= 2,
+        "expected at least 2 commits, got {commit_count}"
+    );
 }
 
 #[test]
@@ -265,7 +272,11 @@ fn test_encryption_default_on_and_no_encrypt() {
 
     let src = home.path().join("secret");
     fs::create_dir_all(&src).unwrap();
-    fs::write(src.join("secret.txt"), "This is super secret Phase 0 data!!!").unwrap();
+    fs::write(
+        src.join("secret.txt"),
+        "This is super secret Phase 0 data!!!",
+    )
+    .unwrap();
 
     soal(home.path())
         .args(["add", src.to_str().unwrap(), "--vault", "secure"])
@@ -273,18 +284,19 @@ fn test_encryption_default_on_and_no_encrypt() {
         .success();
 
     let chunks_dir = vaults_dir(home.path()).join("secure/chunks");
-    let has_plaintext = fs::read_dir(&chunks_dir)
-        .unwrap()
-        .any(|e| {
-            let p = e.unwrap().path();
-            if p.extension() == Some(std::ffi::OsStr::new("chunk")) {
-                let content = fs::read_to_string(&p).unwrap_or_default();
-                content.contains("super secret")
-            } else {
-                false
-            }
-        });
-    assert!(!has_plaintext, "encrypted chunks should not contain plaintext");
+    let has_plaintext = fs::read_dir(&chunks_dir).unwrap().any(|e| {
+        let p = e.unwrap().path();
+        if p.extension() == Some(std::ffi::OsStr::new("chunk")) {
+            let content = fs::read_to_string(&p).unwrap_or_default();
+            content.contains("super secret")
+        } else {
+            false
+        }
+    });
+    assert!(
+        !has_plaintext,
+        "encrypted chunks should not contain plaintext"
+    );
 
     // Unencrypted vault
     soal(home.path())
@@ -298,17 +310,20 @@ fn test_encryption_default_on_and_no_encrypt() {
         .success();
 
     let plain_chunks = vaults_dir(home.path()).join("plain/chunks");
-    let has_plain = fs::read_dir(&plain_chunks)
-        .unwrap()
-        .any(|e| {
-            let p = e.unwrap().path();
-            if p.extension() == Some(std::ffi::OsStr::new("chunk")) {
-                fs::read_to_string(&p).unwrap_or_default().contains("super secret")
-            } else {
-                false
-            }
-        });
-    assert!(has_plain, "unencrypted vault should store readable plaintext");
+    let has_plain = fs::read_dir(&plain_chunks).unwrap().any(|e| {
+        let p = e.unwrap().path();
+        if p.extension() == Some(std::ffi::OsStr::new("chunk")) {
+            fs::read_to_string(&p)
+                .unwrap_or_default()
+                .contains("super secret")
+        } else {
+            false
+        }
+    });
+    assert!(
+        has_plain,
+        "unencrypted vault should store readable plaintext"
+    );
 }
 
 #[test]
@@ -358,4 +373,73 @@ fn test_status_and_vault_not_found() {
         .args(["status", "--vault", "does-not-exist"])
         .assert()
         .failure();
+}
+
+#[test]
+fn test_node_id() {
+    let home = temp_home();
+    soal(home.path())
+        .args(["node", "id"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Node ID:"));
+}
+
+#[test]
+fn test_node_add_peer() {
+    let home = temp_home();
+    soal(home.path())
+        .args(["node", "add-peer", "fake-node-id-for-test"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_node_announce() {
+    let home = temp_home();
+    soal(home.path())
+        .args(["node", "announce", "photos", "head123"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_node_listen() {
+    let home = temp_home();
+    soal(home.path())
+        .args(["node", "listen", "photos"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_snapshot_and_sync_smoke() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "syncvault"])
+        .assert()
+        .success();
+
+    let src = home.path().join("snap-src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("data.txt"), "snapshot sync test data").unwrap();
+
+    soal(home.path())
+        .args(["add", src.to_str().unwrap(), "--vault", "syncvault"])
+        .assert()
+        .success();
+
+    soal(home.path())
+        .args(["snapshot", "test snap", "--vault", "syncvault"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Snapshot"));
+
+    // Sync should not crash (Phase 1 partial impl)
+    soal(home.path())
+        .args(["sync", "--vault", "syncvault"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Sync triggered"));
 }

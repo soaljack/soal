@@ -54,10 +54,7 @@ impl Chunk {
 
 /// Split a file into CDC chunks using FastCDC (v2020).
 /// Loads entire file (acceptable for Phase 0).
-pub fn chunk_file<P: AsRef<Path>>(
-    path: P,
-    config: &ChunkConfig,
-) -> Result<Vec<Chunk>, SoalError> {
+pub fn chunk_file<P: AsRef<Path>>(path: P, config: &ChunkConfig) -> Result<Vec<Chunk>, SoalError> {
     let data = fs::read(path)?;
     Ok(chunk_bytes(&data, config))
 }
@@ -68,12 +65,7 @@ pub fn chunk_bytes(data: &[u8], config: &ChunkConfig) -> Vec<Chunk> {
         return vec![];
     }
 
-    let chunker = FastCDC::new(
-        data,
-        config.min_size,
-        config.avg_size,
-        config.max_size,
-    );
+    let chunker = FastCDC::new(data, config.min_size, config.avg_size, config.max_size);
 
     let mut chunks = Vec::new();
     for entry in chunker {
