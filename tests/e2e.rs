@@ -16,10 +16,13 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-/// Helper: run the soal binary with a controlled HOME.
+/// Helper: run the soal binary with a controlled home directory.
+/// We set both HOME (Unix) and USERPROFILE (Windows) because `dirs::home_dir()`
+/// behaves differently across platforms.
 fn soal(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("soal").expect("binary not found");
     cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
     cmd
 }
 

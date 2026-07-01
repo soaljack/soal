@@ -471,12 +471,18 @@ impl Vault {
     }
 }
 
-/// Get the default base directory for Soal data
+/// Get the default base directory for Soal data.
+/// Respects HOME (preferred for cross-platform tests and consistency) or
+/// USERPROFILE on Windows, falling back to dirs::home_dir().
 pub fn default_soal_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".soal")
-        .join("vaults")
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    home.join(".soal").join("vaults")
 }
 
 #[cfg(test)]
