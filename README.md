@@ -52,6 +52,14 @@ See [spec.md](./spec.md) for the Soal Protocol Specification (v0.2 wire + Phase 
 - **Live watch** (`soal watch`) with debounced FS events
 - Cluster **discovery** gossip (`soal node beacon` / `discover`)
 
+### Phase 2 polish
+- **Policy engine** (`policy.json`): min_replicas, snapshot interval, retention, live_mode, head-age warn
+- **Health** reports (`soal health`) with Ok/Warn/Crit checks
+- **Timed snapshots** via `soal schedule` (single tick, force, or duration loop)
+- **Diff** path-level changes between commits (`soal diff`)
+- **JSON output** (`--json`) for scripting
+- **Embeddable API**: `soal::SoalSession` for apps/agents
+
 ## Quick Start
 
 ```bash
@@ -98,16 +106,19 @@ Passphrase-protected vaults: `soal vault protect <name> --passphrase '…'` or
 
 ```bash
 soal init
+soal [--json] [--passphrase …] <command>
 soal vault create <name> [--no-encrypt] [--replicas N] [--passphrase …]
-soal vault list | policy <name> [--replicas N]
+soal vault list | policy <name> [--replicas N] [--snapshot-interval S] [--live true|false] …
 soal vault protect <name> --passphrase …
 soal vault add-member | remove-member <name> <node-id>
-soal status [--vault <name>]
+soal status | health [--vault <name>]
 soal add <path> [--vault <name>] [--message "..."]
 soal snapshot "<message>" [--vault <name>] [--announce]
 soal restore <commit-hash> [--to <dir>] [--vault <name>]
 soal log [--vault <name>] [-n N]
+soal diff [--from H] [--to H] [--vault <name>]
 soal gc [--vault <name>] [--apply]
+soal schedule [--vault <name>] [--for-secs N] [--every-secs N] [--force]
 soal sync [--vault <name>] [--head <commit>] [--merge] [--from label]
 soal merge <commit> [--vault <name>] [--from label] [--fetch]
 soal watch <path> [--vault <name>] [--debounce-ms N] [--for-secs N] [--announce]
@@ -136,6 +147,10 @@ soal node beacon [--secs N] | discover [--secs N] [--add]
 | `sync.rs` | SyncEngine DAG fetch + checkpoints |
 | `replication.rs` | Pins, replica estimates, self-heal provide |
 | `watch.rs` | Live FS watch + debounced add |
+| `policy.rs` | Vault policy + auto-snapshot state |
+| `health.rs` | Health reports + tree diff |
+| `schedule.rs` | Timed snapshot / pin maintenance loop |
+| `api.rs` | Embeddable `SoalSession` façade |
 | `main.rs` | clap CLI |
 
 ## Design guarantees

@@ -441,7 +441,14 @@ These decisions close design gaps found during Phase 0/1 hardening (aligned with
 | Sync | `--head` or signed gossip heads; never pull local HEAD alone; DAG parents + checkpoints |
 | Discovery | Shared gossip topic for ticket beacons (LAN-friendly without mDNS dependency) |
 
-**Phase 2 next**: full policy engine, timed snapshots, richer health UI, embeddable API polish, placement-aware replication, optional native iroh-blobs disk store.
+**Phase 2 status** (in progress — daily-driver polish):
+- **Policy engine** (`policy.json`): `min_replicas`, `snapshot_interval_secs`, `retain_snapshots`, `live_mode`, `prefer_nodes`, `max_head_age_secs`, `label`
+- **Health** (`src/health.rs`): Ok/Warn/Crit checks for completeness, replication, multi-head, config sig, head age
+- **Schedule** (`src/schedule.rs`): auto-snapshot ticks + pin refresh; CLI `soal schedule [--force|--for-secs]`
+- **Diff**: path-level added/removed/changed between commits
+- **Embeddable API**: `soal::api::SoalSession` (create/add/snapshot/restore/sync/health/diff/invite)
+- **JSON CLI**: global `--json` on status/health/policy/schedule/etc.
+- Remaining: snapshot retention prune, richer peer health probes, placement-aware replication scoring, optional native iroh-blobs disk store
 
 ---
 
