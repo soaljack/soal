@@ -64,10 +64,21 @@ pub struct PolicySnapshot {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct PeerHealthSummary {
+    pub peer: String,
+    pub alive: Option<bool>,
+    pub last_seen_secs_ago: Option<u64>,
+    pub rtt_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ClusterHealth {
     pub level: HealthLevel,
     pub node_id: Option<String>,
     pub peer_count: usize,
+    pub peers_alive: usize,
+    pub peers_dead: usize,
+    pub peer_details: Vec<PeerHealthSummary>,
     pub vault_count: usize,
     pub vaults: Vec<VaultHealth>,
     pub checks: Vec<HealthCheck>,
@@ -236,10 +247,53 @@ pub fn assess_cluster(
     node_id: Option<String>,
     peer_count: usize,
 ) -> Result<ClusterHealth, SoalError> {
+    assess_cluster_with_peers(base_dir, node_id, peer_count, &[], None)
+}
+
+/// Cluster health with optional peer probe results / health store.
+pub fn assess_cluster_with_peers(
+    base_dir: &std::path::Path,
+    node_id: Option<String>,
+    peer_count: usize,
+    peer_ids: &[String],
+    health: Option<&crate::network::PeerHealthStore>,
+) -> Result<ClusterHealth, SoalError> {
     let names = Vault::list(base_dir)?;
     let mut vaults = Vec::new();
     let mut level = HealthLevel::Ok;
     let mut checks = Vec::new();
+    let now = now_secs();
+
+    let mut peer_details = Vec::new();
+    let mut peers_alive = 0usize;
+    let mut peers_dead = 0usize;
+    if let Some(h) = health {
+        for peer in peer_ids {
+            let alive = h.alive.get(peer).copied();
+            let last = h.last_seen.get(peer).copied();
+            let ago = last.map(|t| now.saturating_sub(t));
+            let rtt = h.rtt_ms.get(peer).copied();
+            match alive {
+                Some(true) => peers_alive += 1,
+                Some(false) => peers_dead += 1,
+                None => {}
+            }
+            peer_details.push(PeerHealthSummary {
+                peer: peer.clone(),
+                alive,
+                last_seen_secs_ago: ago,
+                rtt_ms: rtt,
+            });
+        }
+        if peers_dead > 0 {
+            level = worst(level, HealthLevel::Warn);
+            checks.push(HealthCheck {
+                name: "peer_liveness".into(),
+                level: HealthLevel::Warn,
+                message: format!("{peers_dead} peer(s) failed last probe"),
+            });
+        }
+    }
 
     if peer_count == 0 {
         checks.push(HealthCheck {
@@ -291,6 +345,9 @@ pub fn assess_cluster(
         level,
         node_id,
         peer_count,
+        peers_alive,
+        peers_dead,
+        peer_details,
         vault_count: names.len(),
         vaults,
         checks,

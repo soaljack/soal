@@ -441,14 +441,18 @@ These decisions close design gaps found during Phase 0/1 hardening (aligned with
 | Sync | `--head` or signed gossip heads; never pull local HEAD alone; DAG parents + checkpoints |
 | Discovery | Shared gossip topic for ticket beacons (LAN-friendly without mDNS dependency) |
 
-**Phase 2 status** (in progress — daily-driver polish):
+**Phase 2 status** (complete for daily-driver polish goals):
 - **Policy engine** (`policy.json`): `min_replicas`, `snapshot_interval_secs`, `retain_snapshots`, `live_mode`, `prefer_nodes`, `max_head_age_secs`, `label`
-- **Health** (`src/health.rs`): Ok/Warn/Crit checks for completeness, replication, multi-head, config sig, head age
-- **Schedule** (`src/schedule.rs`): auto-snapshot ticks + pin refresh; CLI `soal schedule [--force|--for-secs]`
+- **Snapshot retention**: `snapshots.json` registry; prune oldest beyond `retain_snapshots`; GC live set = HEAD + HEADS + registered tips
+- **Health** (`src/health.rs`): Ok/Warn/Crit; `soal health --probe` for peer liveness
+- **Peer probes**: `soal node probe` → `peer_health.json` (last_seen, alive, rtt_ms)
+- **Placement scoring**: `replication::rank_peers` (prefer_nodes + alive + recency + has_head); sync uses ordered peers
+- **Durable blobs**: iroh-blobs `FsStore` at `~/.soal/blobs/` + vault CAS re-provide
+- **Schedule** (`src/schedule.rs`): auto-snapshot ticks + pin refresh + retention + opportunistic GC
 - **Diff**: path-level added/removed/changed between commits
-- **Embeddable API**: `soal::api::SoalSession` (create/add/snapshot/restore/sync/health/diff/invite)
-- **JSON CLI**: global `--json` on status/health/policy/schedule/etc.
-- Remaining: snapshot retention prune, richer peer health probes, placement-aware replication scoring, optional native iroh-blobs disk store
+- **Embeddable API**: `soal::api::SoalSession`
+- **JSON CLI**: global `--json`
+- Later (Phase 3+): media streaming, FUSE, erasure coding, internet peering
 
 ---
 

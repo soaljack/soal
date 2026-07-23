@@ -1,4 +1,4 @@
-//! Phase 1 networking: persistent node identity, peer list, signed head
+//! Phase 1–2 networking: persistent node identity, peer list, signed head
 //! announcements (vault_id topics), and iroh-blobs content transfer.
 //!
 //! Design (v0.2):
@@ -7,8 +7,8 @@
 //! - HeadAnnouncement is **signed** CBOR (INV-SIG-02); topic = vault_id (KD-08).
 //! - Per-node announce `seq` persists for INV-REPLAY-01.
 //! - `provide` verifies BLAKE3 of data matches the claimed content hash.
-//! - Vault CAS hybrid: re-load wire objects from vault disk into the blob store
-//!   before announce (PR-07a durable serve without empty MemStore after restart).
+//! - **Durable FsStore** under `~/.soal/blobs/` + vault CAS re-provide on announce.
+//! - Peer liveness probes update `peer_health.json` for placement scoring.
 
 use crate::codec::{
     self, decode_head_announcement, encode_head_announcement, vault_topic_hash, HeadAnnouncement,
@@ -22,7 +22,7 @@ use iroh::endpoint::presets::N0;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_blobs::get::request::get_blob;
-use iroh_blobs::store::mem::MemStore;
+use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::BlobsProtocol;
 use iroh_gossip::api::Event as GossipEvent;
 use iroh_gossip::net::Gossip;
@@ -38,6 +38,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const NODE_STATE_FILE: &str = "node.json";
 const SEQ_DIR: &str = "seq";
+const BLOBS_DIR: &str = "blobs";
+const PEER_HEALTH_FILE: &str = "peer_health.json";
 
 /// On-disk node state: secret key + known peers + last announce seqs we **sent**.
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -134,13 +136,49 @@ fn store_last_recv_seq(
     Ok(())
 }
 
+/// On-disk peer liveness / probe history.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct PeerHealthStore {
+    /// peer string → last successful probe unix secs
+    pub last_seen: BTreeMap<String, u64>,
+    /// peer string → last probe succeeded
+    pub alive: BTreeMap<String, bool>,
+    /// peer string → last RTT millis (if measured)
+    #[serde(default)]
+    pub rtt_ms: BTreeMap<String, u64>,
+    pub updated_at: u64,
+}
+
+impl PeerHealthStore {
+    fn path(home: &Path) -> PathBuf {
+        home.join(PEER_HEALTH_FILE)
+    }
+
+    pub fn load(home: &Path) -> Self {
+        let path = Self::path(home);
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, home: &Path) -> Result<(), SoalError> {
+        let path = Self::path(home);
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+}
+
 pub struct Network {
     pub endpoint: Endpoint,
     pub gossip: Arc<Gossip>,
     home: PathBuf,
     peers: BTreeSet<String>,
     blobs: BlobsProtocol,
-    // Keep router alive to serve blobs protocol
+    // Keep store + router alive for durable serve across announces.
+    _blob_store: FsStore,
     _router: Arc<Router>,
     secret: SecretKey,
 }
@@ -162,10 +200,13 @@ impl Network {
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
 
-        // MemStore holds currently provided blobs; vault CAS is re-loaded via
-        // `provide_from_vault` before announce (durable hybrid — PR-07a).
-        let mem_store = MemStore::new();
-        let blobs = BlobsProtocol::new(&mem_store, None);
+        // Durable filesystem blob store (survives process restart).
+        let blobs_root = soal_home.join(BLOBS_DIR);
+        fs::create_dir_all(&blobs_root)?;
+        let fs_store = FsStore::load(&blobs_root)
+            .await
+            .map_err(|e| SoalError::Other(format!("fs blob store: {e}")))?;
+        let blobs = BlobsProtocol::new(&fs_store, None);
 
         let router = Router::builder(endpoint.clone())
             .accept(iroh_blobs::ALPN, blobs.clone())
@@ -177,6 +218,7 @@ impl Network {
             home: soal_home.to_path_buf(),
             peers: state.peers,
             blobs,
+            _blob_store: fs_store,
             _router: Arc::new(router),
             secret,
         })
@@ -691,7 +733,7 @@ impl Network {
         Ok(found.into_iter().collect())
     }
 
-    /// Resolve a blob preferring in-memory provide, falling back to vault CAS (PR-07a native hybrid).
+    /// Resolve a blob from vault CAS and provide into the durable FsStore.
     pub async fn provide_resolved(
         &self,
         vault: &Vault,
@@ -700,6 +742,94 @@ impl Network {
         let data = vault.resolve_blob(hash)?;
         self.provide(hash, &data).await
     }
+
+    /// Probe a single peer: attempt connect (blobs ALPN) with timeout.
+    ///
+    /// Updates `peer_health.json` with last_seen / alive / rtt.
+    pub async fn probe_peer(
+        &self,
+        peer: &str,
+        timeout: Duration,
+    ) -> Result<PeerProbeResult, SoalError> {
+        let addr = Self::parse_peer_addr(peer)?;
+        let start = SystemTime::now();
+        let result =
+            tokio::time::timeout(timeout, self.endpoint.connect(addr, iroh_blobs::ALPN)).await;
+        let mut health = PeerHealthStore::load(&self.home);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let out = match result {
+            Ok(Ok(_conn)) => {
+                let rtt_ms = start
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                health.last_seen.insert(peer.to_string(), now);
+                health.alive.insert(peer.to_string(), true);
+                health.rtt_ms.insert(peer.to_string(), rtt_ms);
+                health.updated_at = now;
+                health.save(&self.home)?;
+                PeerProbeResult {
+                    peer: peer.to_string(),
+                    alive: true,
+                    rtt_ms: Some(rtt_ms),
+                    error: None,
+                }
+            }
+            Ok(Err(e)) => {
+                health.alive.insert(peer.to_string(), false);
+                health.updated_at = now;
+                health.save(&self.home)?;
+                PeerProbeResult {
+                    peer: peer.to_string(),
+                    alive: false,
+                    rtt_ms: None,
+                    error: Some(e.to_string()),
+                }
+            }
+            Err(_) => {
+                health.alive.insert(peer.to_string(), false);
+                health.updated_at = now;
+                health.save(&self.home)?;
+                PeerProbeResult {
+                    peer: peer.to_string(),
+                    alive: false,
+                    rtt_ms: None,
+                    error: Some("probe timeout".into()),
+                }
+            }
+        };
+        Ok(out)
+    }
+
+    /// Probe all configured peers (short default timeout).
+    pub async fn probe_all_peers(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<PeerProbeResult>, SoalError> {
+        let mut out = Vec::new();
+        for peer in self.peers() {
+            out.push(self.probe_peer(&peer, timeout).await?);
+        }
+        Ok(out)
+    }
+
+    /// Load peer health map for placement / health CLI.
+    pub fn peer_health(&self) -> PeerHealthStore {
+        PeerHealthStore::load(&self.home)
+    }
+}
+
+/// Result of a single peer liveness probe.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerProbeResult {
+    pub peer: String,
+    pub alive: bool,
+    pub rtt_ms: Option<u64>,
+    pub error: Option<String>,
 }
 
 #[cfg(test)]

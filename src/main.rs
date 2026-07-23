@@ -51,6 +51,12 @@ enum Commands {
     Health {
         #[arg(short, long)]
         vault: Option<String>,
+        /// Probe peers for liveness before reporting (cluster only)
+        #[arg(long)]
+        probe: bool,
+        /// Probe timeout milliseconds
+        #[arg(long, default_value_t = 2000)]
+        probe_ms: u64,
     },
 
     /// Diff two commits (path-level added/removed/changed)
@@ -282,6 +288,12 @@ enum NodeCmd {
     RemovePeer { node_id: String },
     /// List known peers
     Peers,
+    /// Probe peers for liveness (updates peer_health.json)
+    Probe {
+        /// Probe timeout milliseconds
+        #[arg(long, default_value_t = 2000)]
+        timeout_ms: u64,
+    },
     /// Announce a head for a vault (signed gossip + vault CAS provide)
     Announce { vault: String, head: String },
     /// Listen briefly for head announcements
@@ -391,7 +403,11 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Health { vault } => {
+        Commands::Health {
+            vault,
+            probe,
+            probe_ms,
+        } => {
             if let Some(name) = vault {
                 let v = open_vault(&base_dir, &name, pass)?;
                 let h = health::assess_vault(&v)?;
@@ -402,25 +418,93 @@ async fn main() -> anyhow::Result<()> {
                     for c in &h.checks {
                         println!("  - {:?}: {} — {}", c.level, c.name, c.message);
                     }
+                    // Placement ranking for this vault's peers
+                    if let Ok(net) = Network::open(&soal_home).await {
+                        let pol = policy::load_policy(&v).unwrap_or_default();
+                        let ph = net.peer_health();
+                        let ranked = replication::rank_peers(
+                            &v,
+                            &pol,
+                            &net.peers(),
+                            &ph.last_seen,
+                            &ph.alive,
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        );
+                        if !ranked.is_empty() {
+                            println!("Placement ranks:");
+                            for r in ranked {
+                                println!(
+                                    "  score={:>5} alive={:?} prefer={} has_head={} {}",
+                                    r.score,
+                                    r.alive,
+                                    r.preferred,
+                                    r.has_head,
+                                    r.peer.chars().take(48).collect::<String>()
+                                );
+                            }
+                        }
+                    }
                 }
             } else {
-                let (node_id, peers) = match Network::open(&soal_home).await {
-                    Ok(n) => (Some(n.node_id()), n.peers().len()),
-                    Err(_) => (None, 0),
+                let net = Network::open(&soal_home).await.ok();
+                if probe {
+                    if let Some(ref n) = net {
+                        let results = n.probe_all_peers(Duration::from_millis(probe_ms)).await?;
+                        if !json {
+                            for r in &results {
+                                println!(
+                                    "probe {} alive={} rtt={:?} {:?}",
+                                    r.peer.chars().take(40).collect::<String>(),
+                                    r.alive,
+                                    r.rtt_ms,
+                                    r.error
+                                );
+                            }
+                        }
+                    }
+                }
+                let (node_id, peers, peer_ids, health_store) = match &net {
+                    Some(n) => (
+                        Some(n.node_id()),
+                        n.peers().len(),
+                        n.peers(),
+                        Some(n.peer_health()),
+                    ),
+                    None => (None, 0, vec![], None),
                 };
-                let cluster = health::assess_cluster(&base_dir, node_id, peers)?;
+                let cluster = health::assess_cluster_with_peers(
+                    &base_dir,
+                    node_id,
+                    peers,
+                    &peer_ids,
+                    health_store.as_ref(),
+                )?;
                 if json {
                     print_json(&cluster)?;
                 } else {
                     println!(
-                        "Cluster [{:?}] vaults={} peers={} node={}",
+                        "Cluster [{:?}] vaults={} peers={} alive={} dead={} node={}",
                         cluster.level,
                         cluster.vault_count,
                         cluster.peer_count,
+                        cluster.peers_alive,
+                        cluster.peers_dead,
                         cluster.node_id.as_deref().unwrap_or("?")
                     );
                     for c in &cluster.checks {
                         println!("  - {:?}: {} — {}", c.level, c.name, c.message);
+                    }
+                    for p in &cluster.peer_details {
+                        println!(
+                            "  peer alive={:?} rtt={:?} ago={:?}s {}",
+                            p.alive,
+                            p.rtt_ms,
+                            p.last_seen_secs_ago,
+                            p.peer.chars().take(40).collect::<String>()
+                        );
                     }
                     for v in &cluster.vaults {
                         println!("  {}", health::format_vault_health(v));
@@ -729,17 +813,40 @@ async fn main() -> anyhow::Result<()> {
         Commands::Gc { vault, apply } => {
             let vault_name = vault.unwrap_or_else(|| "default".to_string());
             let v = open_vault(&base_dir, &vault_name, pass)?;
+            // Apply retention first so GC mark set matches policy.
+            if let Ok(pol) = policy::load_policy(&v) {
+                let pruned = policy::apply_retention(&v, &pol)?;
+                if pruned > 0 && !json {
+                    println!("Retention: pruned {pruned} old snapshot registry entries");
+                }
+            }
             let live = v.live_chunk_hashes()?.len();
             let total = v.chunk_count()?;
             let unreachable = total.saturating_sub(live);
             if apply {
-                let n = v.gc_unreachable_chunks()?;
-                println!("GC: removed {n} unreferenced chunks ({live} live remain)");
+                let n = v.gc_all()?;
+                if json {
+                    print_json(&serde_json::json!({
+                        "removed": n,
+                        "live_chunks": live,
+                    }))?;
+                } else {
+                    println!(
+                        "GC: removed {n} unreferenced objects (chunks+commits+trees); {live} live chunks remain"
+                    );
+                }
+            } else if json {
+                print_json(&serde_json::json!({
+                    "unreachable_chunks": unreachable,
+                    "total_chunks": total,
+                    "live_chunks": live,
+                    "dry_run": true,
+                }))?;
             } else {
                 println!(
                     "GC dry-run: {unreachable} unreferenced / {total} total chunks ({live} live)"
                 );
-                println!("Re-run with --apply to delete unreferenced chunks.");
+                println!("Re-run with --apply to delete unreferenced chunks/commits/trees.");
             }
         }
 
@@ -891,11 +998,40 @@ async fn main() -> anyhow::Result<()> {
             NodeCmd::Peers => {
                 let net = Network::open(&soal_home).await?;
                 let peers = net.peers();
+                let health = net.peer_health();
                 if peers.is_empty() {
                     println!("No peers configured.");
+                } else if json {
+                    print_json(&serde_json::json!({
+                        "peers": peers,
+                        "health": health,
+                    }))?;
                 } else {
                     for p in peers {
-                        println!("{p}");
+                        let alive = health.alive.get(&p);
+                        let rtt = health.rtt_ms.get(&p);
+                        println!("{}  alive={:?} rtt_ms={:?}", p, alive, rtt);
+                    }
+                }
+            }
+            NodeCmd::Probe { timeout_ms } => {
+                let net = Network::open(&soal_home).await?;
+                let results = net
+                    .probe_all_peers(Duration::from_millis(timeout_ms))
+                    .await?;
+                if json {
+                    print_json(&results)?;
+                } else if results.is_empty() {
+                    println!("No peers to probe.");
+                } else {
+                    for r in results {
+                        println!(
+                            "{} alive={} rtt_ms={:?} err={:?}",
+                            r.peer.chars().take(56).collect::<String>(),
+                            r.alive,
+                            r.rtt_ms,
+                            r.error
+                        );
                     }
                 }
             }
@@ -957,12 +1093,28 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let net = Arc::new(Network::open(&soal_home).await?);
-            let peers = net.peers();
-            if peers.is_empty() {
+            let peers_raw = net.peers();
+            if peers_raw.is_empty() {
                 println!("No peers configured. Use `soal node add-peer <id>` or `soal node discover --add`.");
                 let _ = net.sync_vault(&vault_name).await;
                 println!("Sync finished for {vault_name}");
                 return Ok(());
+            }
+
+            // Placement: prefer policy prefer_nodes + recently alive peers.
+            let pol = policy::load_policy(&v).unwrap_or_default();
+            let ph = net.peer_health();
+            let peers =
+                replication::ordered_peers_for_sync(&v, &pol, &peers_raw, &ph.last_seen, &ph.alive);
+            if !json {
+                println!(
+                    "[sync] peer order: {}",
+                    peers
+                        .iter()
+                        .map(|p| p.chars().take(16).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
 
             let mut targets: Vec<ContentHash> = Vec::new();

@@ -1,14 +1,13 @@
-//! Replication engine (PR-09): ensure min_replicas policy via provide + pin tracking.
+//! Replication engine (PR-09 / Phase 2 placement): ensure min_replicas policy
+//! via provide + pin tracking + peer scoring.
 //!
-//! Phase 1 model:
 //! - Local pin set under `vault/pins.json` (chunk CIDs we commit to keep).
 //! - `ensure_local_pins` marks all live HEAD chunks as pinned.
-//! - `replicate_head` re-provides the full commit DAG to the network so peers
-//!   can pull (self-heal distribution). Peer-side replica counts are estimated
-//!   from last-known have-announcements when available.
-//! - `replication_status` reports live chunk counts vs `min_replicas`.
+//! - `replicate_head` re-provides the full commit DAG so peers can pull.
+//! - Placement: rank peers by prefer_nodes, recency, and content possession.
 
 use crate::network::Network;
+use crate::policy::VaultPolicy;
 use crate::vault::Vault;
 use crate::{ContentHash, SoalError};
 use serde::{Deserialize, Serialize};
@@ -196,6 +195,118 @@ pub fn under_replicated_chunks(vault: &Vault) -> Result<Vec<ContentHash>, SoalEr
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Placement-aware peer scoring (Phase 2)
+// ---------------------------------------------------------------------------
+
+/// Ranked peer for pull/push placement.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct PeerScore {
+    pub peer: String,
+    pub score: i64,
+    pub preferred: bool,
+    pub last_seen_secs_ago: Option<u64>,
+    pub has_head: bool,
+    pub alive: Option<bool>,
+}
+
+/// Score peers for a vault given policy prefer_nodes + have-lists + health.
+///
+/// Higher score is better. Sort is descending by score.
+pub fn rank_peers(
+    vault: &Vault,
+    policy: &VaultPolicy,
+    peers: &[String],
+    peer_last_seen: &BTreeMap<String, u64>,
+    peer_alive: &BTreeMap<String, bool>,
+    now: u64,
+) -> Vec<PeerScore> {
+    let have = load_have(vault);
+    let head_hex = vault
+        .head()
+        .ok()
+        .flatten()
+        .map(|h| h.to_hex())
+        .unwrap_or_default();
+
+    let mut ranked: Vec<PeerScore> = peers
+        .iter()
+        .map(|peer| {
+            let id_part = peer_id_key(peer);
+            let preferred = policy.prefer_nodes.iter().any(|p| {
+                peer.eq_ignore_ascii_case(p)
+                    || id_part.eq_ignore_ascii_case(p)
+                    || peer.contains(p.as_str())
+            });
+            let mut score: i64 = 0;
+            if preferred {
+                score += 1000;
+            }
+            let last = peer_last_seen
+                .get(peer)
+                .or_else(|| peer_last_seen.get(&id_part))
+                .copied();
+            let last_seen_secs_ago = last.map(|t| now.saturating_sub(t));
+            if let Some(ago) = last_seen_secs_ago {
+                // Fresher is better; 0s → +100, 1h → ~0, older negative.
+                score += 100 - (ago as i64 / 36).min(200);
+            } else {
+                score -= 20; // never seen
+            }
+            let alive = peer_alive
+                .get(peer)
+                .or_else(|| peer_alive.get(&id_part))
+                .copied();
+            match alive {
+                Some(true) => score += 200,
+                Some(false) => score -= 300,
+                None => {}
+            }
+            let has_head = !head_hex.is_empty()
+                && have
+                    .peers
+                    .get(&id_part)
+                    .or_else(|| have.peers.get(peer))
+                    .map(|s| s.contains(&head_hex))
+                    .unwrap_or(false);
+            if has_head {
+                score += 50;
+            }
+            PeerScore {
+                peer: peer.clone(),
+                score,
+                preferred,
+                last_seen_secs_ago,
+                has_head,
+                alive,
+            }
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.peer.cmp(&b.peer)));
+    ranked
+}
+
+/// Extract a stable key from ticket or bare id (prefer bare hex/id if present).
+fn peer_id_key(peer: &str) -> String {
+    // Tickets are long; bare EndpointId is 64 hex. Keep as-is for matching.
+    peer.trim().to_string()
+}
+
+/// Order a peer list for failover using placement scores.
+pub fn ordered_peers_for_sync(
+    vault: &Vault,
+    policy: &VaultPolicy,
+    peers: &[String],
+    peer_last_seen: &BTreeMap<String, u64>,
+    peer_alive: &BTreeMap<String, bool>,
+) -> Vec<String> {
+    rank_peers(vault, policy, peers, peer_last_seen, peer_alive, now_secs())
+        .into_iter()
+        .map(|p| p.peer)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +342,31 @@ mod tests {
         assert_eq!(estimated_replicas(&v, &h), 1);
         note_peer_has(&v, "peer-aaa", &[h]).unwrap();
         assert_eq!(estimated_replicas(&v, &h), 2);
+    }
+
+    #[test]
+    fn rank_peers_prefers_policy_and_alive() {
+        let dir = tempdir().unwrap();
+        let v = Vault::create(dir.path(), "r3", false).unwrap();
+        let policy = VaultPolicy {
+            prefer_nodes: vec!["preferred-peer".into()],
+            ..VaultPolicy::default()
+        };
+        let peers = vec![
+            "other-peer".into(),
+            "preferred-peer".into(),
+            "dead-peer".into(),
+        ];
+        let mut last = BTreeMap::new();
+        last.insert("preferred-peer".into(), now_secs());
+        last.insert("other-peer".into(), now_secs().saturating_sub(10_000));
+        let mut alive = BTreeMap::new();
+        alive.insert("preferred-peer".into(), true);
+        alive.insert("other-peer".into(), true);
+        alive.insert("dead-peer".into(), false);
+        let ranked = rank_peers(&v, &policy, &peers, &last, &alive, now_secs());
+        assert_eq!(ranked[0].peer, "preferred-peer");
+        assert!(ranked[0].score > ranked[1].score);
+        assert_eq!(ranked.last().unwrap().peer, "dead-peer");
     }
 }

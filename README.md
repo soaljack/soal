@@ -19,7 +19,7 @@ Designed for local networks first (LAN, home clusters, off-grid), with a clean p
 
 **Phase 0 (Core Local Foundation)** — complete  
 **Phase 1 (Multi-Node Live Sync)** — complete  
-**Phase 2 (Polish & Reliability)** — in progress (policy engine, health, timed snapshots, embeddable API, JSON CLI)
+**Phase 2 (Polish & Reliability)** — complete (policy, retention, health/probes, placement, durable blobs, schedule, API)
 
 See [spec.md](./spec.md) for the Soal Protocol Specification (v0.2 wire + Phase 1/2 ops).
 
@@ -54,7 +54,11 @@ See [spec.md](./spec.md) for the Soal Protocol Specification (v0.2 wire + Phase 
 
 ### Phase 2 polish
 - **Policy engine** (`policy.json`): min_replicas, snapshot interval, retention, live_mode, head-age warn
-- **Health** reports (`soal health`) with Ok/Warn/Crit checks
+- **Snapshot retention**: registry + prune (`--retain N`); GC marks HEAD + registered tips
+- **Health** reports (`soal health [--probe]`) with Ok/Warn/Crit + peer liveness
+- **Peer probes** (`soal node probe`) update `peer_health.json` for placement
+- **Placement-aware sync**: prefer_nodes + alive/fresh peers ordered first
+- **Durable blob store**: iroh-blobs `FsStore` under `~/.soal/blobs/`
 - **Timed snapshots** via `soal schedule` (single tick, force, or duration loop)
 - **Diff** path-level changes between commits (`soal diff`)
 - **JSON output** (`--json`) for scripting

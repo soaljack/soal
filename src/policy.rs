@@ -210,6 +210,8 @@ pub fn maybe_auto_snapshot(
     }
     let msg = format!("{message_prefix} auto @{}", chrono_like_stamp(now));
     let h = vault.snapshot(&msg)?;
+    register_snapshot(vault, h, &msg, true)?;
+    let _ = apply_retention(vault, policy)?;
     state.last_auto_snapshot_at = now;
     state.last_auto_snapshot_head = Some(h.to_hex());
     state.auto_snapshot_count = state.auto_snapshot_count.saturating_add(1);
@@ -249,6 +251,110 @@ pub fn head_stale(vault: &Vault, policy: &VaultPolicy, now: u64) -> Result<bool,
     };
     let c = vault.load_commit(h)?;
     Ok(now.saturating_sub(c.timestamp) > policy.max_head_age_secs)
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot registry + retention prune
+// ---------------------------------------------------------------------------
+
+const SNAPSHOTS_FILE: &str = "snapshots.json";
+
+/// One registered snapshot tip (explicit or auto).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    pub hash: String,
+    pub timestamp: u64,
+    pub message: String,
+    #[serde(default)]
+    pub auto: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct SnapshotLog {
+    pub entries: Vec<SnapshotEntry>,
+}
+
+fn snapshots_path(vault: &Vault) -> PathBuf {
+    vault.root.join(SNAPSHOTS_FILE)
+}
+
+pub fn load_snapshots(vault: &Vault) -> Result<SnapshotLog, SoalError> {
+    let path = snapshots_path(vault);
+    if !path.exists() {
+        return Ok(SnapshotLog::default());
+    }
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+pub fn save_snapshots(vault: &Vault, log: &SnapshotLog) -> Result<(), SoalError> {
+    let path = snapshots_path(vault);
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(log)?)?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Record a snapshot tip in the registry (newest last).
+pub fn register_snapshot(
+    vault: &Vault,
+    hash: crate::ContentHash,
+    message: &str,
+    auto: bool,
+) -> Result<(), SoalError> {
+    let mut log = load_snapshots(vault)?;
+    let hex = hash.to_hex();
+    // De-dupe if re-registering same tip.
+    log.entries.retain(|e| e.hash != hex);
+    log.entries.push(SnapshotEntry {
+        hash: hex,
+        timestamp: now_secs(),
+        message: message.to_string(),
+        auto,
+    });
+    save_snapshots(vault, &log)
+}
+
+/// Drop oldest registry entries beyond `retain` (0 = no prune). Returns removed count.
+///
+/// Does **not** rewrite history: HEAD and its full parent DAG stay. Pruned entries
+/// only stop protecting abandoned tips from GC once they leave the live set.
+pub fn prune_snapshot_registry(vault: &Vault, retain: u64) -> Result<usize, SoalError> {
+    if retain == 0 {
+        return Ok(0);
+    }
+    let mut log = load_snapshots(vault)?;
+    let retain = retain as usize;
+    if log.entries.len() <= retain {
+        return Ok(0);
+    }
+    let remove = log.entries.len() - retain;
+    // Keep newest `retain` entries (end of vec).
+    log.entries.drain(0..remove);
+    save_snapshots(vault, &log)?;
+    Ok(remove)
+}
+
+/// Commit roots that must stay live for GC: HEAD + registered snapshots + HEADS.
+pub fn protected_commit_roots(vault: &Vault) -> Result<Vec<crate::ContentHash>, SoalError> {
+    use std::collections::BTreeSet;
+    let mut roots = BTreeSet::new();
+    if let Some(h) = vault.head()? {
+        roots.insert(h);
+    }
+    for h in vault.list_heads()? {
+        roots.insert(h);
+    }
+    for e in load_snapshots(vault)?.entries {
+        if let Ok(h) = crate::ContentHash::from_hex(&e.hash) {
+            roots.insert(h);
+        }
+    }
+    Ok(roots.into_iter().collect())
+}
+
+/// Apply retention: prune registry then return how many entries were dropped.
+pub fn apply_retention(vault: &Vault, policy: &VaultPolicy) -> Result<usize, SoalError> {
+    prune_snapshot_registry(vault, policy.retain_snapshots)
 }
 
 #[cfg(test)]
@@ -303,5 +409,33 @@ mod tests {
             ..Default::default()
         };
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn snapshot_registry_prunes_oldest() {
+        let dir = tempdir().unwrap();
+        let mut v = Vault::create(dir.path(), "ret", false).unwrap();
+        let f = dir.path().join("a.txt");
+        fs::write(&f, b"1").unwrap();
+        let c1 = v.add_path(&f, "a.txt").unwrap();
+        register_snapshot(&v, c1, "s1", false).unwrap();
+        fs::write(&f, b"2").unwrap();
+        let c2 = v.add_path(&f, "a.txt").unwrap();
+        register_snapshot(&v, c2, "s2", false).unwrap();
+        fs::write(&f, b"3").unwrap();
+        let c3 = v.add_path(&f, "a.txt").unwrap();
+        register_snapshot(&v, c3, "s3", true).unwrap();
+
+        assert_eq!(load_snapshots(&v).unwrap().entries.len(), 3);
+        let n = prune_snapshot_registry(&v, 2).unwrap();
+        assert_eq!(n, 1);
+        let log = load_snapshots(&v).unwrap();
+        assert_eq!(log.entries.len(), 2);
+        assert_eq!(log.entries[0].hash, c2.to_hex());
+        assert_eq!(log.entries[1].hash, c3.to_hex());
+
+        let roots = protected_commit_roots(&v).unwrap();
+        assert!(roots.contains(&c3)); // HEAD
+        assert!(roots.contains(&c2)); // still registered
     }
 }

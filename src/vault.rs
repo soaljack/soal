@@ -720,20 +720,28 @@ impl Vault {
     }
 
     /// Create an explicit snapshot commit (labels current tree; parents to HEAD).
+    ///
+    /// Registers the tip in the snapshot log for retention policy.
     pub fn snapshot(&mut self, message: &str) -> Result<ContentHash, SoalError> {
-        if let Some(current_head) = self.head()? {
+        let commit_hash = if let Some(current_head) = self.head()? {
             let head_commit = self.load_commit(current_head)?;
             let new_commit = self.make_commit(head_commit.tree, vec![current_head], message)?;
             let commit_hash = self.save_commit(&new_commit)?;
             self.set_head(commit_hash)?;
-            return Ok(commit_hash);
+            commit_hash
+        } else {
+            let empty_tree = Tree::new();
+            let tree_hash = self.save_tree(&empty_tree)?;
+            let commit = self.make_commit(tree_hash, vec![], message)?;
+            let commit_hash = self.save_commit(&commit)?;
+            self.set_head(commit_hash)?;
+            commit_hash
+        };
+        // Best-effort registry (avoid circular dependency issues in tests without policy).
+        let _ = crate::policy::register_snapshot(self, commit_hash, message, false);
+        if let Ok(pol) = crate::policy::load_policy(self) {
+            let _ = crate::policy::apply_retention(self, &pol);
         }
-
-        let empty_tree = Tree::new();
-        let tree_hash = self.save_tree(&empty_tree)?;
-        let commit = self.make_commit(tree_hash, vec![], message)?;
-        let commit_hash = self.save_commit(&commit)?;
-        self.set_head(commit_hash)?;
         Ok(commit_hash)
     }
 
@@ -889,8 +897,18 @@ impl Vault {
 
     /// Collect all chunk hashes reachable from HEAD (for GC mark phase).
     pub fn live_chunk_hashes(&self) -> Result<BTreeSet<ContentHash>, SoalError> {
+        let roots = crate::policy::protected_commit_roots(self)
+            .unwrap_or_else(|_| self.head().ok().flatten().into_iter().collect());
+        self.live_chunk_hashes_from_roots(&roots)
+    }
+
+    /// Mark-phase: all chunks reachable from the given commit roots (and parents).
+    pub fn live_chunk_hashes_from_roots(
+        &self,
+        roots: &[ContentHash],
+    ) -> Result<BTreeSet<ContentHash>, SoalError> {
         let mut live = BTreeSet::new();
-        let mut queue: Vec<ContentHash> = self.head()?.into_iter().collect();
+        let mut queue: Vec<ContentHash> = roots.to_vec();
         let mut seen = BTreeSet::new();
         while let Some(h) = queue.pop() {
             if !seen.insert(h) {
@@ -911,12 +929,34 @@ impl Vault {
         Ok(live)
     }
 
+    /// Commit + tree CIDs reachable from protected roots (for object GC).
+    pub fn live_object_hashes(&self) -> Result<BTreeSet<ContentHash>, SoalError> {
+        let roots = crate::policy::protected_commit_roots(self)
+            .unwrap_or_else(|_| self.head().ok().flatten().into_iter().collect());
+        let mut live = BTreeSet::new();
+        let mut queue: Vec<ContentHash> = roots;
+        let mut seen = BTreeSet::new();
+        while let Some(h) = queue.pop() {
+            if !seen.insert(h) {
+                continue;
+            }
+            if !self.has_commit_object(&h) {
+                continue;
+            }
+            live.insert(h);
+            let c = self.load_commit(h)?;
+            live.insert(c.tree);
+            queue.extend(c.parents.iter().copied());
+        }
+        Ok(live)
+    }
+
     /// Number of chunk objects currently on disk.
     pub fn chunk_count(&self) -> Result<usize, SoalError> {
         Ok(self.chunk_store.list()?.len())
     }
 
-    /// Delete unreferenced chunk files (mark-and-sweep from HEAD DAG).
+    /// Delete unreferenced chunk files (mark-and-sweep from protected roots).
     /// Returns number of chunks removed.
     pub fn gc_unreachable_chunks(&self) -> Result<usize, SoalError> {
         let live = self.live_chunk_hashes()?;
@@ -934,6 +974,52 @@ impl Vault {
             }
         }
         Ok(removed)
+    }
+
+    /// Delete unreferenced commit/tree objects not reachable from protected roots.
+    /// Returns (commits_removed, trees_removed).
+    pub fn gc_unreachable_objects(&self) -> Result<(usize, usize), SoalError> {
+        let live = self.live_object_hashes()?;
+        let mut commits_removed = 0usize;
+        let mut trees_removed = 0usize;
+
+        for dir_name in [COMMITS_DIR, TREES_DIR] {
+            let dir = self.root.join(dir_name);
+            if !dir.exists() {
+                continue;
+            }
+            for entry in fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                // stems are 64-char hex
+                if stem.len() != 64 {
+                    continue;
+                }
+                let Ok(h) = ContentHash::from_hex(stem) else {
+                    continue;
+                };
+                if live.contains(&h) {
+                    continue;
+                }
+                fs::remove_file(&path)?;
+                if dir_name == COMMITS_DIR {
+                    commits_removed += 1;
+                } else {
+                    trees_removed += 1;
+                }
+            }
+        }
+        Ok((commits_removed, trees_removed))
+    }
+
+    /// Full GC: chunks + orphaned commits/trees. Returns total objects removed.
+    pub fn gc_all(&self) -> Result<usize, SoalError> {
+        let chunks = self.gc_unreachable_chunks()?;
+        let (c, t) = self.gc_unreachable_objects()?;
+        Ok(chunks + c + t)
     }
 
     // --- Sync / transfer helpers ---

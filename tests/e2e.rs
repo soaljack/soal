@@ -796,6 +796,50 @@ fn test_merge_conflict_copies_cli() {
 }
 
 #[test]
+fn test_retention_gc_and_node_probe() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "keep", "--no-encrypt"])
+        .assert()
+        .success();
+    soal(home.path())
+        .args(["vault", "policy", "keep", "--retain", "2"])
+        .assert()
+        .success();
+
+    let f = home.path().join("x.txt");
+    for i in 0..4 {
+        fs::write(&f, format!("v{i}")).unwrap();
+        soal(home.path())
+            .args(["add", f.to_str().unwrap(), "--vault", "keep"])
+            .assert()
+            .success();
+        soal(home.path())
+            .args(["snapshot", &format!("snap{i}"), "--vault", "keep"])
+            .assert()
+            .success();
+    }
+
+    // Registry should be pruned to 2 (retain)
+    let snaps = vaults_dir(home.path()).join("keep/snapshots.json");
+    assert!(snaps.exists(), "snapshots registry should exist");
+    let log: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&snaps).unwrap()).unwrap();
+    let n = log["entries"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(n <= 2, "retain=2 should keep at most 2 entries, got {n}");
+
+    soal(home.path())
+        .args(["gc", "--vault", "keep", "--apply"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GC:"));
+
+    // Probe with no peers is fine
+    soal(home.path()).args(["node", "probe"]).assert().success();
+}
+
+#[test]
 fn test_health_policy_schedule_diff_json() {
     let home = temp_home();
     soal(home.path()).arg("init").assert().success();

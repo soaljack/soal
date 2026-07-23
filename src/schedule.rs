@@ -12,10 +12,12 @@ pub struct ScheduleTick {
     pub vault: String,
     pub snapshot: Option<String>,
     pub pins_added: usize,
+    pub snapshots_pruned: usize,
+    pub gc_removed: usize,
     pub skipped_reason: Option<String>,
 }
 
-/// Run one maintenance tick: auto-snapshot if due + refresh pins.
+/// Run one maintenance tick: auto-snapshot if due + pins + retention + light GC.
 pub fn run_tick(vault: &mut Vault, policy: &VaultPolicy) -> Result<ScheduleTick, SoalError> {
     let mut tick = ScheduleTick {
         vault: vault.name.clone(),
@@ -34,6 +36,11 @@ pub fn run_tick(vault: &mut Vault, policy: &VaultPolicy) -> Result<ScheduleTick,
     }
 
     tick.pins_added = replication::ensure_local_pins(vault)?;
+    tick.snapshots_pruned = policy::apply_retention(vault, policy)?;
+    // Opportunistic GC of orphans after retention changes.
+    if tick.snapshots_pruned > 0 || tick.snapshot.is_some() {
+        tick.gc_removed = vault.gc_all().unwrap_or(0);
+    }
     Ok(tick)
 }
 
@@ -65,6 +72,7 @@ pub fn force_auto_snapshot(vault: &mut Vault, message: &str) -> Result<ContentHa
         return Err(SoalError::Other("no HEAD to snapshot".into()));
     }
     let h = vault.snapshot(message)?;
+    let _ = policy::apply_retention(vault, &policy)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -74,7 +82,6 @@ pub fn force_auto_snapshot(vault: &mut Vault, message: &str) -> Result<ContentHa
     state.auto_snapshot_count = state.auto_snapshot_count.saturating_add(1);
     state.updated_at = now;
     policy::save_state(vault, &state)?;
-    let _ = policy; // policy loaded for consistency
     Ok(h)
 }
 
