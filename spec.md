@@ -1,12 +1,12 @@
 # Soal Protocol Specification
 
-**Version:** 0.1 (Initial Draft)  
-**Date:** 2026-06-26  
-**Status:** Draft for review and iterative refinement  
+**Version:** 0.2 (Phase 1 complete)  
+**Date:** 2026-07-23  
+**Status:** Living spec — Phase 0+1 implemented in reference client  
 **Project:** Soal (Soal Protocol / SoalFS)  
 **Founder / BDFL:** Jeffrey Stewart (@soaljack)  
 **License:** MIT OR Apache-2.0 (dual license)  
-**Primary Platforms (initial):** macOS, Windows (Linux support from day one)
+**Primary Platforms (initial):** macOS, Windows, Linux
 
 ---
 
@@ -99,30 +99,35 @@ All core data is **content-addressed** and **immutable** where possible.
 ### 4.3 Commits
 ```rust-like
 struct Commit {
-    tree_cid: Cid,           // Root tree of the snapshot
-    parents: Vec<Cid>,       // Parent commit(s) — usually 0 or 1
-    author: NodeID,
+    tree: ContentHash,       // Root tree of the snapshot (BLAKE3, hex in JSON)
+    parents: Vec<ContentHash>, // Parent commit(s) — usually 0 or 1
+    author: String,          // NodeID string in later phases
     timestamp: u64,
     message: String,
-    signature: Option<Signature>, // Optional for auditability
+    // signature: Option<Signature>, // Optional for auditability (future)
 }
 ```
-- Commits are immutable and content-addressed (hash of the struct).
+- Commits are immutable and content-addressed: `BLAKE3(canonical compact JSON)`.
 - Support linear history or lightweight branching (multiple heads possible; user resolves).
+- Each successful `add` creates a commit **parented to the previous HEAD** and **merges** new paths into the existing tree (does not replace the whole tree).
+
+### 4.3.1 ContentHash encoding
+- Wire/on-disk JSON representation: **64-character lowercase hex** of the 32-byte BLAKE3 digest.
+- Trees, commits, and CLI arguments all use this encoding (never raw JSON number arrays).
 
 ### 4.4 Vaults
 ```rust-like
 struct Vault {
-    id: VaultID,
     name: String,
-    root_heads: Vec<Cid>,           // Current live or latest snapshot heads
-    replication_policy: ReplicationPolicy, // e.g., min_replicas: 2-3+
+    // HEAD file points at current tip commit hash
+    min_replicas: u8,               // Default 2; replication policy seed
     encryption_enabled: bool,       // Default: true
-    live_mode: bool,                // Continuous FS watching + sync
-    members: Vec<NodeID>,           // Or capability-based access
+    // live_mode: bool,             // Continuous FS watching + sync (Phase 1+)
+    // members: Vec<NodeID>,        // Or capability-based access (Phase 1+)
     created_at: u64,
 }
 ```
+- Symmetric vault key (when encryption enabled) is stored in a **separate** `vault.key` file (best-effort mode `0600` on Unix), not in `vault.json`.
 
 **ReplicationPolicy** example:
 - `min_replicas: u8` (default 2 or 3)
@@ -137,9 +142,10 @@ Nodes maintain local pin sets and gossip presence/health information. A replicat
 ## 5. Node Identity & Security Model
 
 ### 5.1 Identity
-- Every node has a persistent **ed25519 keypair**.
-- NodeID = public key (or hash thereof for brevity in some contexts).
+- Every node has a persistent **ed25519 keypair** (Iroh `SecretKey`).
+- NodeID = public key / Iroh EndpointId.
 - Used for authentication, signing commits/invites, and dialing via Iroh.
+- Reference implementation persists the secret key under `~/.soal/node.json` so the NodeID is stable across process restarts.
 
 ### 5.2 Encryption (Default: Always On)
 - **At rest**: Chunks encrypted before storage (or key-wrapped). User can disable per vault or globally.
@@ -389,9 +395,53 @@ All steps are verifiable via content hashes (ciphertext hashes when encryption i
 
 **This specification is a living document.** It will be refined through implementation, testing, and community feedback while maintaining focus on high-quality, reliable, modular code delivered in testable increments.
 
-**Phase 0 status**: Complete (see implementation in src/ and tests/).
+**Phase 0 status**: Complete (see implementation in `src/` and `tests/`).
 
-**Next actions**: Proceed to Phase 1 – Multi-Node Live Sync (Iroh integration, LAN discovery, gossip for heads, basic replication, live working tree sync).
+**Phase 1 status**: **Complete** (multi-node core + control plane + invites + merge + replication + watch):
+- Persistent node identity (Iroh `SecretKey` under `~/.soal/node.json`)
+- Persisted peer list with EndpointId / ticket validation
+- **vault_id** (16 random bytes) per vault; gossip topic = `BLAKE3("soal/v1/vault/" ‖ vault_id)` (**KD-08**)
+- **Signed** HeadAnnouncement CBOR (DOMAIN_HEAD sign preimage); seq + skew + replay checks (**INV-SIG-02**, **INV-REPLAY-01**, **INV-SKEW-01**)
+- iroh-blobs provide/fetch with BLAKE3 integrity; **provide_from_vault** reloads CAS after restart (**PR-07a** hybrid)
+- **SyncEngine** (`src/sync.rs`): parent DAG walk, peer failover, job checkpoints (**PR-07b**)
+- Multi-node gates in `tests/multi_node.rs`: SC-2N-BASIC, SC-IDEM, SC-CORRUPT, SC-SIG, SC-IROH-CID, parent DAG (**PR-07c**)
+- Codec: domain frames + deterministic CBOR Tree/Commit/Head (**src/codec.rs**)
+- Dual-read: `.bin` wire primary, legacy `.json` still loadable
+- Signed commits when node identity present; import rejects bad signatures
+- **PR-05**: Argon2id passphrase `WrappedKey` (`vault.wrapped.json`) + signed `VaultConfig` (`config_sig` / `owner` / `config_seq`)
+- **PR-12**: Signed invites (`soal invite generate|join`) — vault key sealed under invite secret; membership shared
+- **PR-08**: Multi-head tracking (`HEADS`) + `merge_head` conflict copies (`name (conflict from Label).ext`)
+- **PR-09**: Replication pins, peer-have estimates, `soal replicate [--push]` self-heal provide
+- **PR-11**: Live FS watch (`soal watch`) via `notify` with debounce
+- **Discovery**: gossip topic `BLAKE3("soal/v1/discovery")` — `soal node beacon` / `discover [--add]`
+- CLI: `log`, `gc`, `merge`, `sync --merge`, `replicate`, invites, watch, snapshot `--announce`
+
+### Implementation quality notes (reference implementation)
+
+These decisions close design gaps found during Phase 0/1 hardening (aligned with design doc v0.2):
+
+| Topic | Decision |
+|-------|----------|
+| Content hash in JSON | 64-char lowercase hex (not raw byte arrays); uppercase accepted on parse |
+| Tree/commit addressing | **Wire CID** = BLAKE3(`DOMAIN \|\| cbor(body)`); store as `.bin`; dual-read legacy JSON via `legacy_json_hash` |
+| Incremental `add` | Merges into HEAD tree; commit parents to HEAD (**INV-DAG-01**, **INV-TREE-01**) |
+| Vault key storage | Separate `vault.key` (0600); optional Argon2id wrap in `vault.wrapped.json` |
+| vault_id | 16-byte OsRng id, 32 hex in `vault.json`; legacy open auto-migrates |
+| Store integrity | `put`/`put_verified`/`get` reject BLAKE3 mismatches; **CID collision** is a hard error (**INV-IMPORT-03**) |
+| Path safety | Reject `..`, absolute, backslash, NUL on add/restore (**INV-PATH-01**) |
+| Wire framing | Domain 16-byte prefix + CBOR body; CID = BLAKE3(wire) (**INV-CID-WIRE-01**) |
+| Commit signatures | ed25519 via Iroh `SecretKey`; sign preimage = DOMAIN_COMMIT\|\|cbor(fields 1–6); unsigned allowed for local-only (**INV-SIG-01** on non-zero sigs) |
+| Head signatures | DOMAIN_HEAD\|\|cbor(SignAnn fields 1,2,4–8); gossip payload raw CBOR 9 keys (**INV-SIG-02**) |
+| Config signatures | DOMAIN_CONFIG\|\|JSON body without `config_sig`; owner NodeID required when signed |
+| Invites | DOMAIN_INVITE sign preimage; vault key sealed with invite secret + AAD `soal/invite/key/v1` |
+| Conflicts | Merge keeps ours; theirs written to conflict-copy path; multi-parent commit |
+| Replication | Local pins + estimated replica counts; `--push` re-provides HEAD DAG |
+| Node identity | Persistent across CLI invocations; used as commit author when present |
+| Peer list | Persisted; invalid EndpointIds rejected at add time |
+| Sync | `--head` or signed gossip heads; never pull local HEAD alone; DAG parents + checkpoints |
+| Discovery | Shared gossip topic for ticket beacons (LAN-friendly without mDNS dependency) |
+
+**Phase 2 next**: full policy engine, timed snapshots, richer health UI, embeddable API polish, placement-aware replication, optional native iroh-blobs disk store.
 
 ---
 

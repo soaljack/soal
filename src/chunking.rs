@@ -1,10 +1,10 @@
-//! Content-Defined Chunking using FastCDC + BLAKE3 hashing
+//! Content-Defined Chunking using FastCDC + BLAKE3 hashing.
 use crate::{ContentHash, SoalError};
 use fastcdc::v2020::FastCDC;
 use std::fs;
 use std::path::Path;
 
-/// Configuration for chunking
+/// Configuration for chunking.
 #[derive(Clone, Debug)]
 pub struct ChunkConfig {
     pub avg_size: u32,
@@ -26,7 +26,7 @@ impl Default for ChunkConfig {
 impl ChunkConfig {
     pub fn new(avg_size: u32) -> Self {
         let min = (avg_size / 4).max(64 * 1024);
-        let max = avg_size * 4;
+        let max = avg_size.saturating_mul(4);
         Self {
             avg_size,
             min_size: min,
@@ -36,24 +36,25 @@ impl ChunkConfig {
 }
 
 /// A plaintext content chunk produced by CDC.
-/// The `hash` here is the BLAKE3 of plaintext (used for internal purposes / tests).
-/// The actual storage key in an encrypted vault is the BLAKE3 of the *ciphertext*
-/// (see Vault::store_chunk and Security Model).
+///
+/// `hash` is the BLAKE3 of plaintext (internal reference / tests).
+/// The storage key in an encrypted vault is the BLAKE3 of the *ciphertext*
+/// (see `Vault::store_chunk` and Security Model §5.2.1).
 #[derive(Clone, Debug)]
 pub struct Chunk {
-    pub hash: ContentHash, // plaintext BLAKE3 (for reference/dedup logic inside chunker)
-    pub data: Vec<u8>,     // plaintext
+    pub hash: ContentHash,
+    pub data: Vec<u8>,
 }
 
 impl Chunk {
     pub fn from_data(data: Vec<u8>) -> Self {
-        let hash = blake3::hash(&data).into();
+        let hash = ContentHash::of(&data);
         Self { hash, data }
     }
 }
 
 /// Split a file into CDC chunks using FastCDC (v2020).
-/// Loads entire file (acceptable for Phase 0).
+/// Loads the entire file (acceptable for Phase 0/1; streaming later).
 pub fn chunk_file<P: AsRef<Path>>(path: P, config: &ChunkConfig) -> Result<Vec<Chunk>, SoalError> {
     let data = fs::read(path)?;
     Ok(chunk_bytes(&data, config))
@@ -72,8 +73,7 @@ pub fn chunk_bytes(data: &[u8], config: &ChunkConfig) -> Vec<Chunk> {
         let start = entry.offset;
         let end = start + entry.length;
         if end <= data.len() {
-            let chunk_data = data[start..end].to_vec();
-            chunks.push(Chunk::from_data(chunk_data));
+            chunks.push(Chunk::from_data(data[start..end].to_vec()));
         }
     }
 
@@ -83,15 +83,14 @@ pub fn chunk_bytes(data: &[u8], config: &ChunkConfig) -> Vec<Chunk> {
     chunks
 }
 
-/// Compute BLAKE3 of entire data (for tree manifests etc.)
+/// Compute BLAKE3 of entire data (for tree/commit manifests, etc.).
 pub fn hash_bytes(data: &[u8]) -> ContentHash {
-    blake3::hash(data).into()
+    ContentHash::of(data)
 }
 
-/// Verify a chunk's hash matches its content
+/// Verify a chunk's plaintext hash matches its content.
 pub fn verify_chunk(chunk: &Chunk) -> bool {
-    let computed: ContentHash = blake3::hash(&chunk.data).into();
-    computed == chunk.hash
+    ContentHash::of(&chunk.data) == chunk.hash
 }
 
 #[cfg(test)]
@@ -118,5 +117,18 @@ mod tests {
             let h2 = hash_bytes(&data);
             prop_assert_eq!(h1, h2);
         }
+    }
+
+    #[test]
+    fn empty_input_yields_no_chunks() {
+        assert!(chunk_bytes(&[], &ChunkConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn small_input_is_one_chunk() {
+        let data = b"tiny";
+        let chunks = chunk_bytes(data, &ChunkConfig::default());
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].data, data);
     }
 }

@@ -53,6 +53,9 @@ jobs:
       - name: Run E2E tests (Phase 0 + Phase 1 network)
         run: cargo test --test e2e -- --quiet
 
+      - name: Run multi-node SC-* gates (Phase 1)
+        run: cargo test --test multi_node -- --quiet
+
       - name: Run full test suite
         run: cargo test --all -- --quiet
 

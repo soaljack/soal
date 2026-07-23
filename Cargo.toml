@@ -14,7 +14,7 @@ authors = ["Jeffrey Stewart (@soaljack)"]
 all-features = true
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 blake3 = "1.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -28,9 +28,12 @@ fastcdc = "3.1"
 iroh = "1.0.0"
 iroh-blobs = "0.103.0"
 iroh-gossip = "0.101.0"
+iroh-tickets = "1.0.0"
 notify = "8.2.0"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "rt"] }
 futures-lite = "2.6.1"
+argon2 = "0.5"
+base64 = "0.22"
 
 [dev-dependencies]
 proptest = "1.6"

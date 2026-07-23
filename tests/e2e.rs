@@ -1,13 +1,14 @@
-//! End-to-end tests for the Soal CLI (Phase 0 + early Phase 1).
+//! End-to-end tests for the Soal CLI (Phase 0 + Phase 1).
 //!
 //! These tests drive the compiled binary and verify core user workflows:
-//! - Vault creation (encryption on by default)
-//! - Adding files and directories
-//! - Snapshots and history
+//! - Vault creation (encryption on by default; key separated from config)
+//! - Adding files and directories (incremental merge into HEAD tree)
+//! - Snapshots and history (DAG parents)
 //! - Restore fidelity
 //! - Encryption at rest
 //! - Deduplication
-//! - Basic node/network commands (some skipped on Windows due to iroh networking in CI)
+//! - Persistent node identity + peers
+//! - Basic network commands
 
 use assert_cmd::prelude::*;
 use assert_fs::TempDir as AssertTempDir;
@@ -17,8 +18,6 @@ use std::path::Path;
 use std::process::Command;
 
 /// Helper: run the soal binary with a controlled home directory.
-/// We set both HOME (Unix) and USERPROFILE (Windows) because `dirs::home_dir()`
-/// behaves differently across platforms.
 fn soal(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("soal").expect("binary not found");
     cmd.env("HOME", home);
@@ -26,17 +25,14 @@ fn soal(home: &Path) -> Command {
     cmd
 }
 
-/// Helper: create a temp "home" directory for isolation.
 fn temp_home() -> AssertTempDir {
     AssertTempDir::new().expect("failed to create temp dir")
 }
 
-/// Helper to get the vaults directory under a home.
 fn vaults_dir(home: &Path) -> std::path::PathBuf {
     home.join(".soal").join("vaults")
 }
 
-/// Create some test data in a directory.
 fn create_test_data(dir: &Path) {
     fs::create_dir_all(dir.join("subdir")).unwrap();
     fs::write(
@@ -59,6 +55,8 @@ fn test_init() {
 
     let vaults = vaults_dir(home.path());
     assert!(vaults.exists());
+    // Persistent node identity
+    assert!(home.path().join(".soal/node.json").exists());
 }
 
 #[test]
@@ -75,11 +73,13 @@ fn test_vault_create_default_encrypted() {
     let vault_dir = vaults_dir(home.path()).join("photos");
     assert!(vault_dir.join("vault.json").exists());
     assert!(vault_dir.join("chunks").exists());
+    assert!(vault_dir.join("vault.key").exists());
 
-    // Verify encryption is on in config
     let config: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(vault_dir.join("vault.json")).unwrap()).unwrap();
     assert_eq!(config["encryption_enabled"], true);
+    // Key must not live in vault.json
+    assert!(config.get("key_hex").is_none() || config["key_hex"].is_null());
 }
 
 #[test]
@@ -131,12 +131,10 @@ fn test_add_file_snapshot_and_restore_fidelity() {
         .assert()
         .success();
 
-    // Create source data
     let src = home.path().join("srcdata");
     fs::create_dir_all(&src).unwrap();
     fs::write(src.join("hello.txt"), "Hello Soal Phase 0!\nLine two.\n").unwrap();
 
-    // Add + snapshot
     soal(home.path())
         .args(["add", src.to_str().unwrap(), "--vault", "test"])
         .assert()
@@ -147,7 +145,6 @@ fn test_add_file_snapshot_and_restore_fidelity() {
         .assert()
         .success();
 
-    // Restore
     let status_out = soal(home.path())
         .args(["status", "--vault", "test"])
         .output()
@@ -172,7 +169,6 @@ fn test_add_file_snapshot_and_restore_fidelity() {
         .assert()
         .success();
 
-    // Verify fidelity
     let restored_file = restore_dir.join("srcdata/hello.txt");
     assert!(restored_file.exists());
     let content = fs::read_to_string(&restored_file).unwrap();
@@ -197,7 +193,6 @@ fn test_add_directory_recursive() {
         .success()
         .stdout(predicate::str::contains("Added"));
 
-    // Should have created nested structure under the base name
     let vault_dir = vaults_dir(home.path()).join("media");
     let head = get_head(&vault_dir);
 
@@ -217,6 +212,54 @@ fn test_add_directory_recursive() {
     assert!(restore_dir.join("media-src/subdir/nested.txt").exists());
     let nested = fs::read_to_string(restore_dir.join("media-src/subdir/nested.txt")).unwrap();
     assert!(nested.contains("Deeply nested"));
+}
+
+#[test]
+fn test_incremental_add_merges_files() {
+    // Design invariant: second add must not wipe the first file from the tree.
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "merge"])
+        .assert()
+        .success();
+
+    let a = home.path().join("a.txt");
+    let b = home.path().join("b.txt");
+    fs::write(&a, "content A").unwrap();
+    fs::write(&b, "content B").unwrap();
+
+    soal(home.path())
+        .args(["add", a.to_str().unwrap(), "--vault", "merge"])
+        .assert()
+        .success();
+    soal(home.path())
+        .args(["add", b.to_str().unwrap(), "--vault", "merge"])
+        .assert()
+        .success();
+
+    let head = get_head(&vaults_dir(home.path()).join("merge"));
+    let restore_dir = home.path().join("merged-out");
+    soal(home.path())
+        .args([
+            "restore",
+            &head,
+            "--vault",
+            "merge",
+            "--to",
+            restore_dir.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(restore_dir.join("a.txt")).unwrap(),
+        "content A"
+    );
+    assert_eq!(
+        fs::read_to_string(restore_dir.join("b.txt")).unwrap(),
+        "content B"
+    );
 }
 
 #[test]
@@ -254,13 +297,33 @@ fn test_multiple_snapshots_create_history() {
     let commits_dir = vaults_dir(home.path()).join("hist/commits");
     let commit_count = fs::read_dir(&commits_dir)
         .unwrap()
-        .filter(|e| e.as_ref().unwrap().path().extension() == Some(std::ffi::OsStr::new("json")))
+        .filter(|e| {
+            let p = e.as_ref().unwrap().path();
+            let ext = p.extension().and_then(|s| s.to_str());
+            matches!(ext, Some("bin") | Some("json"))
+        })
         .count();
 
     assert!(
         commit_count >= 2,
         "expected at least 2 commits, got {commit_count}"
     );
+
+    // Verify parent chain via library (wire .bin dual-read)
+    let vault = soal::vault::Vault::open(vaults_dir(home.path()), "hist").unwrap();
+    let head = vault.head().unwrap().expect("HEAD present");
+    let commit = vault.load_commit(head).unwrap();
+    assert!(
+        !commit.parents.is_empty(),
+        "HEAD snapshot should parent to previous commit"
+    );
+    // tree CID is ContentHash (hex-displayable)
+    assert_eq!(commit.tree.to_hex().len(), 64);
+    // On-disk wire object must content-address
+    let wire_path = commits_dir.join(format!("{}.bin", head.to_hex()));
+    assert!(wire_path.exists(), "commit stored as .bin wire object");
+    let wire = fs::read(&wire_path).unwrap();
+    assert_eq!(soal::ContentHash::of(&wire), head);
 }
 
 #[test]
@@ -268,7 +331,6 @@ fn test_encryption_default_on_and_no_encrypt() {
     let home = temp_home();
     soal(home.path()).arg("init").assert().success();
 
-    // Encrypted vault (default)
     soal(home.path())
         .args(["vault", "create", "secure"])
         .assert()
@@ -302,7 +364,6 @@ fn test_encryption_default_on_and_no_encrypt() {
         "encrypted chunks should not contain plaintext"
     );
 
-    // Unencrypted vault
     soal(home.path())
         .args(["vault", "create", "plain", "--no-encrypt"])
         .assert()
@@ -343,7 +404,7 @@ fn test_deduplication() {
     fs::create_dir_all(&src).unwrap();
     let content = "This exact string will be duplicated across files.";
     fs::write(src.join("one.txt"), content).unwrap();
-    fs::write(src.join("two.txt"), content).unwrap(); // identical content
+    fs::write(src.join("two.txt"), content).unwrap();
 
     soal(home.path())
         .args(["add", src.to_str().unwrap(), "--vault", "dedup"])
@@ -354,14 +415,12 @@ fn test_deduplication() {
         .unwrap()
         .count();
 
-    // With good CDC + dedup we should have very few chunks (ideally 1 for identical data)
     assert!(
         chunk_count <= 3,
         "expected strong deduplication, got {chunk_count} chunks"
     );
 }
 
-/// Helper to extract HEAD commit from status output.
 fn get_head(vault_dir: &Path) -> String {
     let status = fs::read_to_string(vault_dir.join("HEAD")).unwrap_or_default();
     status.trim().to_string()
@@ -372,7 +431,6 @@ fn test_status_and_vault_not_found() {
     let home = temp_home();
     soal(home.path()).arg("init").assert().success();
 
-    // Non-existent vault should error reasonably
     soal(home.path())
         .args(["status", "--vault", "does-not-exist"])
         .assert()
@@ -380,42 +438,193 @@ fn test_status_and_vault_not_found() {
 }
 
 #[test]
-fn test_node_id() {
+fn test_node_id_stable() {
     let home = temp_home();
+    let out1 = soal(home.path()).args(["node", "id"]).output().unwrap();
+    assert!(out1.status.success());
+    let stdout1 = String::from_utf8_lossy(&out1.stdout);
+    let id1 = stdout1
+        .lines()
+        .find(|l| l.contains("Node ID:"))
+        .map(|l| l.trim().to_string())
+        .expect("node id line");
+    assert!(
+        stdout1.contains("Ticket:"),
+        "node id should print EndpointTicket for dialing"
+    );
+
+    let out2 = soal(home.path()).args(["node", "id"]).output().unwrap();
+    let id2 = String::from_utf8_lossy(&out2.stdout)
+        .lines()
+        .find(|l| l.contains("Node ID:"))
+        .map(|l| l.trim().to_string())
+        .expect("node id line");
+
+    assert_eq!(
+        id1, id2,
+        "node identity must be stable across CLI invocations"
+    );
+}
+
+#[test]
+fn test_node_add_peer_validates_and_persists() {
+    let home = temp_home();
+    // Generate a real node id
+    let out = soal(home.path()).args(["node", "id"]).output().unwrap();
+    let id_line = String::from_utf8_lossy(&out.stdout);
+    let node_id = id_line
+        .lines()
+        .find(|l| l.contains("Node ID:"))
+        .and_then(|l| l.split_whitespace().nth(2))
+        .expect("parse node id")
+        .to_string();
+
+    // Using own id as peer is fine for persistence test
     soal(home.path())
-        .args(["node", "id"])
+        .args(["node", "add-peer", &node_id])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Node ID:"));
-}
+        .stdout(predicate::str::contains("Added peer"));
 
-#[test]
-fn test_node_add_peer() {
-    let home = temp_home();
     soal(home.path())
-        .args(["node", "add-peer", "fake-node-id-for-test"])
+        .args(["node", "peers"])
         .assert()
-        .success();
+        .success()
+        .stdout(predicate::str::contains(&node_id));
+
+    // Invalid peer rejected
+    soal(home.path())
+        .args(["node", "add-peer", "not-a-valid-endpoint-id"])
+        .assert()
+        .failure();
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))] // real networking (iroh) can be flaky on Windows CI runners
+#[cfg(not(target_os = "windows"))]
 fn test_node_announce() {
     let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
     soal(home.path())
-        .args(["node", "announce", "photos", "head123"])
+        .args(["vault", "create", "photos", "--no-encrypt"])
         .assert()
         .success();
+
+    let src = home.path().join("ann-src");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), "announce me").unwrap();
+    let add = soal(home.path())
+        .args(["add", src.to_str().unwrap(), "--vault", "photos"])
+        .output()
+        .unwrap();
+    assert!(add.status.success());
+    let stdout = String::from_utf8_lossy(&add.stdout);
+    // "Added '...' -> commit <hex>"
+    let commit = stdout
+        .split_whitespace()
+        .find(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("commit hash in add output")
+        .to_string();
+
+    soal(home.path())
+        .args(["node", "announce", "photos", &commit])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Broadcast signed head"));
 }
 
 #[test]
-#[cfg(not(target_os = "windows"))] // real networking + short listener loop; keep responsive on all platforms
+#[cfg(not(target_os = "windows"))]
 fn test_node_listen() {
     let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "photos", "--no-encrypt"])
+        .assert()
+        .success();
     soal(home.path())
         .args(["node", "listen", "photos"])
         .assert()
         .success();
+}
+
+#[test]
+fn test_large_file_roundtrip() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "big", "--no-encrypt"])
+        .assert()
+        .success();
+
+    // ~3 MiB of patterned data to force multi-chunk CDC
+    let big = home.path().join("big.bin");
+    let mut data = Vec::with_capacity(3 * 1024 * 1024);
+    for i in 0..(3 * 1024 * 1024) {
+        data.push((i % 251) as u8);
+    }
+    fs::write(&big, &data).unwrap();
+
+    let out = soal(home.path())
+        .args(["add", big.to_str().unwrap(), "--vault", "big"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let commit = stdout
+        .split_whitespace()
+        .find(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("commit")
+        .to_string();
+
+    let dest = home.path().join("restored-big");
+    soal(home.path())
+        .args([
+            "restore",
+            &commit,
+            "--vault",
+            "big",
+            "--to",
+            dest.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let restored = fs::read(dest.join("big.bin")).unwrap();
+    assert_eq!(restored, data, "large file restore must be bit-exact");
+}
+
+#[test]
+fn test_log_and_gc() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "lg", "--no-encrypt"])
+        .assert()
+        .success();
+    let f = home.path().join("one.txt");
+    fs::write(&f, "log history content").unwrap();
+    soal(home.path())
+        .args(["add", f.to_str().unwrap(), "--vault", "lg"])
+        .assert()
+        .success();
+    soal(home.path())
+        .args(["snapshot", "label", "--vault", "lg"])
+        .assert()
+        .success();
+    soal(home.path())
+        .args(["log", "--vault", "lg", "-n", "5"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("label").or(predicate::str::contains("Add")));
+    soal(home.path())
+        .args(["gc", "--vault", "lg"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry-run"));
+    soal(home.path())
+        .args(["status", "--vault", "lg"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("vault_id="));
 }
 
 #[test]
@@ -442,10 +651,9 @@ fn test_snapshot_and_sync_smoke() {
         .success()
         .stdout(predicate::str::contains("Snapshot"));
 
-    // Sync should not crash (Phase 1 partial impl)
     soal(home.path())
         .args(["sync", "--vault", "syncvault"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Sync triggered"));
+        .stdout(predicate::str::contains("Sync finished"));
 }
