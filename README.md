@@ -18,9 +18,10 @@ Designed for local networks first (LAN, home clusters, off-grid), with a clean p
 ## Status
 
 **Phase 0 (Core Local Foundation)** — complete  
-**Phase 1 (Multi-Node Live Sync)** — complete (signed control plane, SyncEngine, invites, conflict merge, replication, live watch)
+**Phase 1 (Multi-Node Live Sync)** — complete  
+**Phase 2 (Polish & Reliability)** — in progress (policy engine, health, timed snapshots, embeddable API, JSON CLI)
 
-See [spec.md](./spec.md) for the Soal Protocol Specification (v0.2 wire + Phase 1 ops).
+See [spec.md](./spec.md) for the Soal Protocol Specification (v0.2 wire + Phase 1/2 ops).
 
 ## Features
 
@@ -79,6 +80,13 @@ soal invite join invite.token
 # Live folder + replication
 soal watch ./notes --vault notes --for-secs 3600
 soal replicate --vault photos --push
+
+# Phase 2: policy, health, schedule, diff
+soal vault policy photos --snapshot-interval 3600 --live true
+soal health --vault photos
+soal --json health
+soal schedule --vault photos --force
+soal diff --vault photos
 ```
 
 Data lives under `~/.soal/vaults/<name>/`. Node identity: `~/.soal/node.json`.

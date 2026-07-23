@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
+use soal::health;
 use soal::invite::{self, InviteRole};
 use soal::network::Network;
+use soal::policy::{self, VaultPolicy};
 use soal::replication;
+use soal::schedule;
 use soal::sync;
 use soal::vault::{default_soal_dir, default_soal_home, Vault};
 use soal::watch;
@@ -21,6 +24,10 @@ struct Cli {
     #[arg(long, global = true, env = "SOAL_PASSPHRASE")]
     passphrase: Option<String>,
 
+    /// Emit machine-readable JSON where supported
+    #[arg(long, global = true)]
+    json: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -38,6 +45,39 @@ enum Commands {
     Status {
         #[arg(short, long)]
         vault: Option<String>,
+    },
+
+    /// Health report for a vault or the whole cluster
+    Health {
+        #[arg(short, long)]
+        vault: Option<String>,
+    },
+
+    /// Diff two commits (path-level added/removed/changed)
+    Diff {
+        /// From commit (default: HEAD parent)
+        #[arg(long)]
+        from: Option<String>,
+        /// To commit (default: HEAD)
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(short, long)]
+        vault: Option<String>,
+    },
+
+    /// Run policy scheduler (timed snapshots + pin refresh)
+    Schedule {
+        #[arg(short, long)]
+        vault: Option<String>,
+        /// How long to run (seconds); 0 = single tick
+        #[arg(long, default_value_t = 0)]
+        for_secs: u64,
+        /// Poll interval between ticks (seconds)
+        #[arg(long, default_value_t = 5)]
+        every_secs: u64,
+        /// Force a snapshot now regardless of interval
+        #[arg(long)]
+        force: bool,
     },
 
     /// Manage vaults
@@ -175,11 +215,26 @@ enum VaultCmd {
     },
     /// List vaults
     List,
-    /// Set vault policy (min replicas)
+    /// Show or update vault policy (replicas, snapshot interval, live, retention)
     Policy {
         name: String,
         #[arg(long)]
         replicas: Option<u8>,
+        /// Auto-snapshot interval seconds (0 disables)
+        #[arg(long)]
+        snapshot_interval: Option<u64>,
+        /// Max snapshots to retain when pruning (0 = unlimited)
+        #[arg(long)]
+        retain: Option<u64>,
+        /// Enable/disable live_mode policy flag
+        #[arg(long)]
+        live: Option<bool>,
+        /// Warn when HEAD older than this many seconds (0 = off)
+        #[arg(long)]
+        max_head_age: Option<u64>,
+        /// Operator label
+        #[arg(long)]
+        label: Option<String>,
     },
     /// Wrap vault key with passphrase
     Protect {
@@ -255,12 +310,18 @@ fn open_vault(
     Ok(Vault::open_with_passphrase(base_dir, name, passphrase)?)
 }
 
+fn print_json<T: serde::Serialize>(v: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let soal_home = default_soal_home();
     let base_dir = default_soal_dir();
     let pass = cli.passphrase.as_deref();
+    let json = cli.json;
 
     match cli.command {
         Commands::Init { data_dir } => {
@@ -268,41 +329,189 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&dir)?;
             std::fs::create_dir_all(&soal_home)?;
             let _ = Network::open(&soal_home).await;
-            println!("Initialized Soal data dir at {}", dir.display());
-            println!("Node home: {}", soal_home.display());
-            println!("Use `soal vault create <name>` to get started.");
+            if json {
+                print_json(&serde_json::json!({
+                    "data_dir": dir,
+                    "node_home": soal_home,
+                }))?;
+            } else {
+                println!("Initialized Soal data dir at {}", dir.display());
+                println!("Node home: {}", soal_home.display());
+                println!("Use `soal vault create <name>` to get started.");
+            }
         }
 
         Commands::Status { vault } => {
             if let Some(name) = vault {
                 let v = open_vault(&base_dir, &name, pass)?;
-                println!("{}", v.status()?);
-                if let Ok(st) = replication::replication_status(&v) {
-                    println!(
-                        "Replication: min={} live_chunks={} pinned={} under_replicated≈{} peers_tracked={}",
-                        st.min_replicas,
-                        st.live_chunks,
-                        st.pinned_chunks,
-                        st.estimated_under_replicated,
-                        st.peers_known
-                    );
-                }
-                let heads = v.list_heads()?;
-                if heads.len() > 1 {
-                    println!("Heads ({}):", heads.len());
-                    for h in heads {
-                        println!("  {}", h.to_hex());
+                if json {
+                    let h = health::assess_vault(&v)?;
+                    print_json(&h)?;
+                } else {
+                    println!("{}", v.status()?);
+                    if let Ok(st) = replication::replication_status(&v) {
+                        println!(
+                            "Replication: min={} live_chunks={} pinned={} under_replicated≈{} peers_tracked={}",
+                            st.min_replicas,
+                            st.live_chunks,
+                            st.pinned_chunks,
+                            st.estimated_under_replicated,
+                            st.peers_known
+                        );
+                    }
+                    if let Ok(p) = policy::load_policy(&v) {
+                        println!(
+                            "Policy: snapshot_interval={}s live={} retain={} max_head_age={}s",
+                            p.snapshot_interval_secs,
+                            p.live_mode,
+                            p.retain_snapshots,
+                            p.max_head_age_secs
+                        );
+                    }
+                    let heads = v.list_heads()?;
+                    if heads.len() > 1 {
+                        println!("Heads ({}):", heads.len());
+                        for h in heads {
+                            println!("  {}", h.to_hex());
+                        }
                     }
                 }
             } else {
                 let vaults = Vault::list(&base_dir)?;
-                if vaults.is_empty() {
+                if json {
+                    print_json(&vaults)?;
+                } else if vaults.is_empty() {
                     println!("No vaults found. Run `soal vault create myvault`");
                 } else {
                     println!("Vaults:");
                     for v in vaults {
                         println!("  - {v}");
                     }
+                }
+            }
+        }
+
+        Commands::Health { vault } => {
+            if let Some(name) = vault {
+                let v = open_vault(&base_dir, &name, pass)?;
+                let h = health::assess_vault(&v)?;
+                if json {
+                    print_json(&h)?;
+                } else {
+                    println!("{}", health::format_vault_health(&h));
+                    for c in &h.checks {
+                        println!("  - {:?}: {} — {}", c.level, c.name, c.message);
+                    }
+                }
+            } else {
+                let (node_id, peers) = match Network::open(&soal_home).await {
+                    Ok(n) => (Some(n.node_id()), n.peers().len()),
+                    Err(_) => (None, 0),
+                };
+                let cluster = health::assess_cluster(&base_dir, node_id, peers)?;
+                if json {
+                    print_json(&cluster)?;
+                } else {
+                    println!(
+                        "Cluster [{:?}] vaults={} peers={} node={}",
+                        cluster.level,
+                        cluster.vault_count,
+                        cluster.peer_count,
+                        cluster.node_id.as_deref().unwrap_or("?")
+                    );
+                    for c in &cluster.checks {
+                        println!("  - {:?}: {} — {}", c.level, c.name, c.message);
+                    }
+                    for v in &cluster.vaults {
+                        println!("  {}", health::format_vault_health(v));
+                    }
+                }
+            }
+        }
+
+        Commands::Diff { from, to, vault } => {
+            let vault_name = vault.unwrap_or_else(|| "default".to_string());
+            let v = open_vault(&base_dir, &vault_name, pass)?;
+            let to_h = match to {
+                Some(s) => ContentHash::from_hex(&s)?,
+                None => v
+                    .head()?
+                    .ok_or_else(|| anyhow::anyhow!("no HEAD; pass --to"))?,
+            };
+            let from_h = match from {
+                Some(s) => ContentHash::from_hex(&s)?,
+                None => {
+                    let c = v.load_commit(to_h)?;
+                    c.parents.first().copied().ok_or_else(|| {
+                        anyhow::anyhow!("HEAD has no parent; pass --from <commit>")
+                    })?
+                }
+            };
+            let d = health::diff_commits(&v, from_h, to_h)?;
+            if json {
+                print_json(&d)?;
+            } else {
+                println!("diff {} → {}", &d.from[..12], &d.to[..12]);
+                for p in &d.added {
+                    println!("  + {p}");
+                }
+                for p in &d.removed {
+                    println!("  - {p}");
+                }
+                for p in &d.changed {
+                    println!("  ~ {p}");
+                }
+                if d.added.is_empty() && d.removed.is_empty() && d.changed.is_empty() {
+                    println!("  (no path differences)");
+                }
+            }
+        }
+
+        Commands::Schedule {
+            vault,
+            for_secs,
+            every_secs,
+            force,
+        } => {
+            let vault_name = vault.unwrap_or_else(|| "default".to_string());
+            let mut v = open_vault(&base_dir, &vault_name, pass)?;
+            if force {
+                let h = schedule::force_auto_snapshot(&mut v, "forced schedule snapshot")?;
+                if json {
+                    print_json(&serde_json::json!({"snapshot": h.to_hex()}))?;
+                } else {
+                    println!("Forced snapshot: {h}");
+                }
+            } else if for_secs == 0 {
+                let policy = policy::load_policy(&v)?;
+                let tick = schedule::run_tick(&mut v, &policy)?;
+                if json {
+                    print_json(&tick)?;
+                } else {
+                    match &tick.snapshot {
+                        Some(s) => println!("Auto-snapshot: {s}"),
+                        None => println!(
+                            "No snapshot ({})",
+                            tick.skipped_reason.as_deref().unwrap_or("n/a")
+                        ),
+                    }
+                    println!("Pins refreshed (+{})", tick.pins_added);
+                }
+            } else {
+                let ticks = schedule::run_for(
+                    &mut v,
+                    Duration::from_secs(for_secs),
+                    Duration::from_secs(every_secs.max(1)),
+                )?;
+                if json {
+                    print_json(&ticks)?;
+                } else {
+                    for t in &ticks {
+                        if let Some(s) = &t.snapshot {
+                            println!("[{}] snapshot {s}", t.vault);
+                        }
+                    }
+                    println!("Schedule finished ({} ticks)", ticks.len());
                 }
             }
         }
@@ -316,22 +525,41 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let encrypt = !no_encrypt;
                 let mut v = Vault::create_with_policy(&base_dir, &name, encrypt, replicas)?;
+                let pol = VaultPolicy {
+                    min_replicas: replicas.max(1),
+                    ..VaultPolicy::default()
+                };
+                policy::save_policy(&v, &pol)?;
                 if let Some(p) = create_pass.as_deref().or(pass) {
                     if encrypt {
                         v.enable_passphrase(p)?;
                         println!("Vault key wrapped with passphrase.");
                     }
                 }
-                println!("Created vault '{name}' (encryption={encrypt}, min_replicas={replicas})");
-                println!("vault_id={}", v.config.vault_id);
-                if let Some(sig) = &v.config.config_sig {
-                    println!("config_sig={}", &sig[..16.min(sig.len())]);
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": name,
+                        "encryption": encrypt,
+                        "min_replicas": replicas,
+                        "vault_id": v.config.vault_id,
+                        "path": v.root,
+                    }))?;
+                } else {
+                    println!(
+                        "Created vault '{name}' (encryption={encrypt}, min_replicas={replicas})"
+                    );
+                    println!("vault_id={}", v.config.vault_id);
+                    if let Some(sig) = &v.config.config_sig {
+                        println!("config_sig={}", &sig[..16.min(sig.len())]);
+                    }
+                    println!("Data: {}", v.root.display());
                 }
-                println!("Data: {}", v.root.display());
             }
             VaultCmd::List => {
                 let vaults = Vault::list(&base_dir)?;
-                if vaults.is_empty() {
+                if json {
+                    print_json(&vaults)?;
+                } else if vaults.is_empty() {
                     println!("No vaults yet.");
                 } else {
                     for name in vaults {
@@ -339,19 +567,60 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            VaultCmd::Policy { name, replicas } => {
+            VaultCmd::Policy {
+                name,
+                replicas,
+                snapshot_interval,
+                retain,
+                live,
+                max_head_age,
+                label,
+            } => {
                 let mut v = open_vault(&base_dir, &name, pass)?;
-                if let Some(r) = replicas {
-                    v.set_min_replicas(r)?;
-                    println!(
-                        "Set min_replicas={r} on vault '{name}' (config_seq={})",
-                        v.config.config_seq
-                    );
+                let current = policy::load_policy(&v)?;
+                let any = replicas.is_some()
+                    || snapshot_interval.is_some()
+                    || retain.is_some()
+                    || live.is_some()
+                    || max_head_age.is_some()
+                    || label.is_some();
+                if any {
+                    let updated = current.with_updates(
+                        replicas,
+                        snapshot_interval,
+                        retain,
+                        live,
+                        max_head_age,
+                        label,
+                    )?;
+                    let applied = policy::apply_policy(&mut v, updated)?;
+                    if json {
+                        print_json(&applied)?;
+                    } else {
+                        println!(
+                            "Policy updated on '{name}': min_replicas={} snapshot_interval={}s live={} retain={} max_head_age={}s",
+                            applied.min_replicas,
+                            applied.snapshot_interval_secs,
+                            applied.live_mode,
+                            applied.retain_snapshots,
+                            applied.max_head_age_secs
+                        );
+                    }
+                } else if json {
+                    print_json(&current)?;
                 } else {
+                    println!("Policy for vault '{name}':");
+                    println!("  min_replicas: {}", current.min_replicas);
                     println!(
-                        "Vault '{name}' min_replicas={} config_seq={}",
-                        v.config.min_replicas, v.config.config_seq
+                        "  snapshot_interval_secs: {}",
+                        current.snapshot_interval_secs
                     );
+                    println!("  retain_snapshots: {}", current.retain_snapshots);
+                    println!("  live_mode: {}", current.live_mode);
+                    println!("  max_head_age_secs: {}", current.max_head_age_secs);
+                    println!("  prefer_nodes: {:?}", current.prefer_nodes);
+                    println!("  label: {:?}", current.label);
+                    println!("  config_seq: {}", v.config.config_seq);
                 }
             }
             VaultCmd::Protect {

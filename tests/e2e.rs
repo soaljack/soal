@@ -796,6 +796,70 @@ fn test_merge_conflict_copies_cli() {
 }
 
 #[test]
+fn test_health_policy_schedule_diff_json() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args([
+            "vault",
+            "create",
+            "daily",
+            "--no-encrypt",
+            "--replicas",
+            "2",
+        ])
+        .assert()
+        .success();
+
+    let f = home.path().join("a.txt");
+    fs::write(&f, "v1").unwrap();
+    soal(home.path())
+        .args(["add", f.to_str().unwrap(), "--vault", "daily"])
+        .assert()
+        .success();
+    fs::write(&f, "v2").unwrap();
+    soal(home.path())
+        .args(["add", f.to_str().unwrap(), "--vault", "daily"])
+        .assert()
+        .success();
+
+    soal(home.path())
+        .args([
+            "vault",
+            "policy",
+            "daily",
+            "--snapshot-interval",
+            "30",
+            "--live",
+            "true",
+            "--label",
+            "sanctuary",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("snapshot_interval=30"));
+
+    soal(home.path())
+        .args(["--json", "health", "--vault", "daily"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"vault\""))
+        .stdout(predicate::str::contains("daily"));
+
+    soal(home.path())
+        .args(["schedule", "--vault", "daily", "--force"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Forced snapshot"));
+
+    soal(home.path())
+        .args(["diff", "--vault", "daily"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("diff"));
+}
+
+#[test]
 fn test_watch_ingest_short() {
     let home = temp_home();
     soal(home.path()).arg("init").assert().success();

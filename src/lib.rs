@@ -1,21 +1,28 @@
-//! Soal core library — Phase 0 local foundation + Phase 1 networking.
+//! Soal core library — Phase 0–2.
 //!
 //! Content-addressed storage, CDC chunking, vault encryption, Merkle trees/commits,
-//! and Iroh-based gossip + blob transfer.
+//! Iroh gossip + blob transfer, policy engine, health, and embeddable API.
 
+pub mod api;
 pub mod chunking;
 pub mod codec;
 pub mod commit;
 pub mod crypto;
+pub mod health;
 pub mod identity;
 pub mod invite;
 pub mod network;
+pub mod policy;
 pub mod replication;
+pub mod schedule;
 pub mod store;
 pub mod sync;
 pub mod tree;
 pub mod vault;
 pub mod watch;
+
+// Re-export the high-level session API for embedders.
+pub use api::SoalSession;
 
 pub use anyhow::Result;
 pub use blake3::Hash as Blake3Hash;
