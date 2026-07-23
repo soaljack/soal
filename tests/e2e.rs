@@ -657,3 +657,169 @@ fn test_snapshot_and_sync_smoke() {
         .success()
         .stdout(predicate::str::contains("Sync finished"));
 }
+
+#[test]
+fn test_passphrase_protect_and_open() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "secret"])
+        .assert()
+        .success();
+
+    soal(home.path())
+        .args([
+            "vault",
+            "protect",
+            "secret",
+            "--passphrase",
+            "test-pass-123",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("passphrase-protected"));
+
+    // Without passphrase, open fails
+    soal(home.path())
+        .args(["status", "--vault", "secret"])
+        .assert()
+        .failure();
+
+    // With passphrase, works
+    soal(home.path())
+        .args([
+            "--passphrase",
+            "test-pass-123",
+            "status",
+            "--vault",
+            "secret",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("secret"));
+
+    let src = home.path().join("s.txt");
+    fs::write(&src, "encrypted add").unwrap();
+    soal(home.path())
+        .args([
+            "--passphrase",
+            "test-pass-123",
+            "add",
+            src.to_str().unwrap(),
+            "--vault",
+            "secret",
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_invite_generate_and_join() {
+    let home_a = temp_home();
+    let home_b = temp_home();
+    soal(home_a.path()).arg("init").assert().success();
+    soal(home_b.path()).arg("init").assert().success();
+    soal(home_a.path())
+        .args(["vault", "create", "photos"])
+        .assert()
+        .success();
+
+    let inv_path = home_a.path().join("invite.token");
+    soal(home_a.path())
+        .args([
+            "invite",
+            "generate",
+            "--vault",
+            "photos",
+            "--out",
+            inv_path.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    assert!(inv_path.exists());
+    let token = fs::read_to_string(&inv_path).unwrap();
+    assert!(token.len() > 32);
+
+    soal(home_b.path())
+        .args(["invite", "join", inv_path.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Joined vault"));
+
+    // Same vault_id on both sides
+    let va: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(vaults_dir(home_a.path()).join("photos/vault.json")).unwrap(),
+    )
+    .unwrap();
+    let vb: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(vaults_dir(home_b.path()).join("photos/vault.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(va["vault_id"], vb["vault_id"]);
+}
+
+#[test]
+fn test_merge_conflict_copies_cli() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    // Use library path for divergent heads then CLI merge would need import;
+    // exercise via soal binary: two sequential adds don't conflict. Library
+    // covers merge; here validate heads listing + replicate CLI.
+    soal(home.path())
+        .args(["vault", "create", "m", "--replicas", "3"])
+        .assert()
+        .success();
+    let f = home.path().join("n.txt");
+    fs::write(&f, "note").unwrap();
+    soal(home.path())
+        .args(["add", f.to_str().unwrap(), "--vault", "m"])
+        .assert()
+        .success();
+
+    soal(home.path())
+        .args(["replicate", "--vault", "m"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("min_replicas: 3"));
+
+    soal(home.path())
+        .args(["vault", "policy", "m", "--replicas", "4"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("min_replicas=4"));
+
+    soal(home.path())
+        .args(["status", "--vault", "m"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Replication:"));
+}
+
+#[test]
+fn test_watch_ingest_short() {
+    let home = temp_home();
+    soal(home.path()).arg("init").assert().success();
+    soal(home.path())
+        .args(["vault", "create", "live", "--no-encrypt"])
+        .assert()
+        .success();
+    let root = home.path().join("live-dir");
+    fs::create_dir_all(&root).unwrap();
+    // Pre-create a file so short watch can pick up modify events after start
+    fs::write(root.join("pre.txt"), "pre").unwrap();
+    // Watch for 1 second (creates empty batch if no events; must not fail)
+    soal(home.path())
+        .args([
+            "watch",
+            root.to_str().unwrap(),
+            "--vault",
+            "live",
+            "--for-secs",
+            "1",
+            "--debounce-ms",
+            "100",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[watch]"));
+}

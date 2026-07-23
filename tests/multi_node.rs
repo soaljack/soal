@@ -5,12 +5,12 @@
 
 use soal::crypto::generate_key;
 use soal::identity;
+use soal::invite::{self, InviteRole};
 use soal::network::Network;
 use soal::sync;
 use soal::vault::Vault;
 use soal::ContentHash;
 use std::fs;
-use std::sync::Arc;
 use tempfile::tempdir;
 
 /// SC-2N-BASIC: A adds file, provides blobs; B fetches commit DAG and restores equal content.
@@ -188,11 +188,17 @@ async fn sc_dag_parents_fetched() {
     let tip = vault_a.load_commit(c2).unwrap();
     assert_eq!(tip.parents, vec![c1]);
 
-    // Provide only tip's collect (includes tip commit+tree+chunks, NOT parent commit)
-    // For full DAG we need parent commit+tree too — collect only tip objects.
-    // Provide both commits' objects so parent walk can complete.
-    net_a.provide_from_vault(&vault_a, c1).await.unwrap();
-    net_a.provide_from_vault(&vault_a, c2).await.unwrap();
+    // Single provide of tip must include parent DAG objects (tech-debt fix).
+    let provided = net_a.provide_from_vault(&vault_a, c2).await.unwrap();
+    assert!(
+        provided >= 4,
+        "tip provide should include parent commit+tree+chunks, got {provided}"
+    );
+    let blobs = vault_a.collect_provide_hashes(c2).unwrap();
+    assert!(
+        blobs.iter().any(|(h, _)| *h == c1),
+        "collect_provide_hashes(tip) must include parent commit"
+    );
     net_b.add_peer(id_a.clone()).unwrap();
 
     sync::fetch_dag(&vault_b, &net_b, &[id_a], c2, true)
@@ -206,6 +212,48 @@ async fn sc_dag_parents_fetched() {
     vault_b.restore(c2, &out).unwrap();
     assert_eq!(fs::read_to_string(out.join("1.txt")).unwrap(), "first");
     assert_eq!(fs::read_to_string(out.join("2.txt")).unwrap(), "second");
+}
+
+/// SC-INVITE: generate invite on A, join on B, share key, transfer over network.
+#[tokio::test]
+async fn sc_invite_join_and_sync() {
+    let a_home = tempdir().unwrap();
+    let b_home = tempdir().unwrap();
+    let a_base = a_home.path().join("vaults");
+    let b_base = b_home.path().join("vaults");
+    fs::create_dir_all(&a_base).unwrap();
+    fs::create_dir_all(&b_base).unwrap();
+
+    let net_a = Network::open(a_home.path()).await.unwrap();
+    let mut net_b = Network::open(b_home.path()).await.unwrap();
+    let sk = net_a.secret_key().clone();
+    let id_a = net_a.node_id();
+
+    let mut vault_a = Vault::create(&a_base, "shared", true)
+        .unwrap()
+        .with_soal_home(a_home.path());
+    let inv = invite::generate_invite(&vault_a, &sk, InviteRole::Write, Some(3600)).unwrap();
+    let token = inv.to_token().unwrap();
+
+    let vault_b = invite::join_invite(&b_base, b_home.path(), &token, None).unwrap();
+    assert_eq!(vault_b.config.vault_id, vault_a.config.vault_id);
+    assert_eq!(vault_b.vault_key(), vault_a.vault_key());
+
+    let f = a_base.join("photo.bin");
+    fs::write(&f, b"invite-shared-payload").unwrap();
+    let commit = vault_a.add_path(&f, "photo.bin").unwrap();
+    net_a.provide_from_vault(&vault_a, commit).await.unwrap();
+    net_b.add_peer(id_a.clone()).unwrap();
+
+    sync::fetch_dag(&vault_b, &net_b, &[id_a], commit, true)
+        .await
+        .expect("invite-path sync");
+    let out = b_base.join("out");
+    vault_b.restore(commit, &out).unwrap();
+    assert_eq!(
+        fs::read_to_string(out.join("photo.bin")).unwrap(),
+        "invite-shared-payload"
+    );
 }
 
 /// Durable provide: after Network restart, re-provide from vault CAS still works.
@@ -247,10 +295,4 @@ async fn sc_failover_no_peers_errors() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("no peers"));
-}
-
-// Keep Arc import used if we add concurrent tests later.
-#[allow(dead_code)]
-fn _arc_typecheck() {
-    let _: Option<Arc<()>> = None;
 }

@@ -78,22 +78,37 @@ grep -q "Broadcast signed head\|Provided" "$ROOT/ann.txt" || sleep 3
 grep -q "Broadcast signed head\|Provided" "$ROOT/ann.txt"
 
 echo "→ B syncs by --head (iroh-blobs pull using ticket addressing)"
-run_b sync --vault photos --head "$HEAD" | tee "$ROOT/sync.txt" || true
+SYNC_OK=0
+for attempt in 1 2 3 4 5; do
+    if run_b sync --vault photos --head "$HEAD" | tee "$ROOT/sync.txt"; then
+        if grep -q "Ingested" "$ROOT/sync.txt" 2>/dev/null; then
+            SYNC_OK=1
+            break
+        fi
+    fi
+    echo "  sync attempt $attempt incomplete; retrying…"
+    sleep 2
+done
 
-if grep -q "Ingested" "$ROOT/sync.txt" 2>/dev/null; then
+if [[ "$SYNC_OK" -eq 1 ]]; then
     echo "→ restore on B"
     run_b restore "$HEAD" --vault photos --to "$ROOT/restored"
     find "$ROOT/restored" -type f -name 'note.txt' | grep -q .
     echo "✓ Phase 1 transfer + restore OK"
 else
-    echo "⚠ Peer transfer did not complete (see $ROOT/sync.txt)."
-    echo "  Signed announce path still required; multi_node tests cover in-process transfer."
+    echo "⚠ Peer transfer did not complete after retries (relay/firewall)."
+    echo "  In-process multi_node SC-* gates still cover transfer correctness."
     cat "$ROOT/sync.txt" || true
 fi
 kill "$ANN_PID" 2>/dev/null || true
 wait "$ANN_PID" 2>/dev/null || true
 
-echo "→ log / gc smoke on A"
+echo "→ invite generate smoke on A"
+run_a invite generate --vault photos --out "$ROOT/inv.token" | head -5
+test -s "$ROOT/inv.token"
+
+echo "→ replicate / log / gc smoke on A"
+run_a replicate --vault photos | grep -q "min_replicas"
 run_a log --vault photos -n 3 | head -20
 run_a gc --vault photos | grep -q dry-run
 

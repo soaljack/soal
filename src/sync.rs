@@ -263,7 +263,6 @@ pub async fn sync_head(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::generate_key;
     use tempfile::tempdir;
 
     #[test]
@@ -312,6 +311,5 @@ mod tests {
             }
         }
         assert!(b.is_complete(c).unwrap());
-        let _ = generate_key; // silence if unused in some configs
     }
 }

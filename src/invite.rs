@@ -6,7 +6,7 @@
 //! with the same vault_id + key so multi-node SC-KEY-SHARE is production-ready.
 
 use crate::codec::{self, DOMAIN_INVITE, VAULT_ID_LEN};
-use crate::crypto::{generate_key, unwrap_key, wrap_key, Key};
+use crate::crypto::{unwrap_key, wrap_key, Key};
 use crate::identity;
 use crate::vault::Vault;
 use crate::SoalError;
@@ -287,11 +287,6 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>, SoalError> {
         .decode(s.trim())
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(s.trim()))
         .map_err(|e| SoalError::Other(format!("base64: {e}")))
-}
-
-/// Generate a random invite secret (test helper / token building).
-pub fn random_invite_secret() -> Key {
-    generate_key()
 }
 
 #[cfg(test)]

@@ -510,6 +510,24 @@ impl Vault {
         Ok(())
     }
 
+    /// Read alternate tips from HEADS file only (does not inject current HEAD).
+    fn list_heads_file_only(&self) -> Result<BTreeSet<ContentHash>, SoalError> {
+        let mut heads = BTreeSet::new();
+        let path = self.root.join(HEADS_FILE);
+        if path.exists() {
+            for line in fs::read_to_string(path)?.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(h) = ContentHash::from_hex(line) {
+                    heads.insert(h);
+                }
+            }
+        }
+        Ok(heads)
+    }
+
     /// Get current HEAD commit hash.
     pub fn head(&self) -> Result<Option<ContentHash>, SoalError> {
         let path = self.root.join(HEAD_FILE);
@@ -1044,21 +1062,9 @@ impl Vault {
 
     /// All known heads (HEAD plus HEADS file).
     pub fn list_heads(&self) -> Result<BTreeSet<ContentHash>, SoalError> {
-        let mut heads = BTreeSet::new();
+        let mut heads = self.list_heads_file_only()?;
         if let Some(h) = self.head()? {
             heads.insert(h);
-        }
-        let path = self.root.join(HEADS_FILE);
-        if path.exists() {
-            for line in fs::read_to_string(path)?.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(h) = ContentHash::from_hex(line) {
-                    heads.insert(h);
-                }
-            }
         }
         Ok(heads)
     }
@@ -1140,30 +1146,64 @@ impl Vault {
         Ok(())
     }
 
-    /// Collect all blob hashes needed to fully serve a commit (commit + tree + chunks).
+    /// Collect all blob hashes needed to fully serve a commit **and its parent DAG**.
+    ///
+    /// Walks parents (bounded by `MAX_JOB_COMMITS`) so a single announce/provide
+    /// can satisfy SyncEngine parent fetches (closes the tip-only provide gap).
     pub fn collect_provide_hashes(
         &self,
         commit_hash: ContentHash,
     ) -> Result<Vec<(ContentHash, Vec<u8>)>, SoalError> {
+        use std::collections::VecDeque;
         let mut out = Vec::new();
-        let commit_bytes = self.export_commit_bytes(commit_hash)?;
-        out.push((commit_hash, commit_bytes));
+        let mut seen_commits = BTreeSet::new();
+        let mut seen_blobs = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(commit_hash);
 
-        let commit = self.load_commit(commit_hash)?;
-        let tree_bytes = self.export_tree_bytes(commit.tree)?;
-        out.push((commit.tree, tree_bytes));
+        while let Some(cid) = queue.pop_front() {
+            if !seen_commits.insert(cid) {
+                continue;
+            }
+            if seen_commits.len() > crate::codec::MAX_JOB_COMMITS {
+                return Err(SoalError::Other(
+                    "provide DAG too deep (MAX_JOB_COMMITS)".into(),
+                ));
+            }
+            if !self.has_commit_object(&cid) {
+                continue;
+            }
+            let commit_bytes = self.export_commit_bytes(cid)?;
+            if seen_blobs.insert(cid) {
+                out.push((cid, commit_bytes));
+            }
 
-        let tree = self.load_tree(commit.tree)?;
-        for ch in tree.all_chunk_hashes() {
-            if let Ok(bytes) = self.export_stored_chunk(ch) {
-                out.push((ch, bytes));
+            let commit = self.load_commit(cid)?;
+            for p in &commit.parents {
+                queue.push_back(*p);
+            }
+
+            if self.has_tree_object(&commit.tree) && seen_blobs.insert(commit.tree) {
+                let tree_bytes = self.export_tree_bytes(commit.tree)?;
+                out.push((commit.tree, tree_bytes));
+                let tree = self.load_tree(commit.tree)?;
+                for ch in tree.all_chunk_hashes() {
+                    if seen_blobs.insert(ch) {
+                        if let Ok(bytes) = self.export_stored_chunk(ch) {
+                            out.push((ch, bytes));
+                        }
+                    }
+                }
             }
         }
         Ok(out)
     }
 
     /// Ingest a full snapshot from a peer: commit → tree → missing chunks.
-    /// Returns true if HEAD was updated.
+    ///
+    /// If local HEAD is empty, adopts remote as HEAD. If local already has a
+    /// different HEAD, records remote as an alternate head (multi-head) instead
+    /// of silently overwriting — use `merge_head` to resolve.
     pub async fn ingest_commit_from_peer<F, Fut>(
         &self,
         peer: &str,
@@ -1198,10 +1238,21 @@ impl Vault {
             }
         }
 
-        // Advance HEAD if we don't have one, or if remote is different
-        // (Phase 1: last-write-wins on explicit sync; multi-head later)
-        self.set_head(commit_hash)?;
-        Ok(true)
+        match self.head()? {
+            None => {
+                self.set_head(commit_hash)?;
+                Ok(true)
+            }
+            Some(local) if local == commit_hash => {
+                self.record_head(commit_hash)?;
+                Ok(false)
+            }
+            Some(_) => {
+                // Divergent: keep local HEAD, record remote tip for merge.
+                self.record_head(commit_hash)?;
+                Ok(false)
+            }
+        }
     }
 }
 
@@ -1293,19 +1344,33 @@ fn load_or_migrate_key(
 }
 
 /// Canonical config sign preimage: DOMAIN_CONFIG || compact JSON (no config_sig).
+///
+/// Keys are sorted (BTreeMap) so the sign bytes are deterministic across platforms.
 pub fn config_sign_preimage(config: &VaultConfig) -> Result<Vec<u8>, SoalError> {
-    let body = serde_json::json!({
-        "name": config.name,
-        "encryption_enabled": config.encryption_enabled,
-        "min_replicas": config.min_replicas,
-        "created_at": config.created_at,
-        "vault_id": config.vault_id,
-        "config_seq": config.config_seq,
-        "members": config.members,
-        "owner": config.owner,
-        "key_wrapped": config.key_wrapped,
-    });
-    let json = serde_json::to_vec(&body)?;
+    use serde_json::{Map, Value};
+    let mut map = Map::new();
+    map.insert("config_seq".into(), Value::from(config.config_seq));
+    map.insert("created_at".into(), Value::from(config.created_at));
+    map.insert(
+        "encryption_enabled".into(),
+        Value::from(config.encryption_enabled),
+    );
+    map.insert("key_wrapped".into(), Value::from(config.key_wrapped));
+    map.insert(
+        "members".into(),
+        Value::Array(config.members.iter().cloned().map(Value::String).collect()),
+    );
+    map.insert("min_replicas".into(), Value::from(config.min_replicas));
+    map.insert("name".into(), Value::String(config.name.clone()));
+    map.insert(
+        "owner".into(),
+        match &config.owner {
+            Some(o) => Value::String(o.clone()),
+            None => Value::Null,
+        },
+    );
+    map.insert("vault_id".into(), Value::String(config.vault_id.clone()));
+    let json = serde_json::to_vec(&Value::Object(map))?;
     Ok(codec::frame(&codec::DOMAIN_CONFIG, &json))
 }
 
